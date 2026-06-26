@@ -1,0 +1,6 @@
+Validation report
+=================
+- manifest.json parses as valid JSON
+- popup.js syntax checked
+- Added PNG/JPG selector
+- Added OneNote 20pt clipboard output

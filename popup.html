@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>HTML 一鍵轉換器</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <main>
+    <header>
+      <div class="logo">H</div>
+      <div>
+        <h1>HTML 一鍵轉換器</h1>
+        <p>Opera・Edge・Chrome</p>
+      </div>
+    </header>
+
+    <section class="group">
+      <h2>轉為圖片</h2>
+
+      <label class="field">
+        <span>圖片格式</span>
+        <select id="image-format">
+          <option value="png" selected>PNG（較清晰、適合保存）</option>
+          <option value="jpg">JPG（體積較小）</option>
+        </select>
+      </label>
+
+      <button id="capture-visible" class="primary">
+        <span>擷取目前畫面</span>
+        <small>依所選格式儲存目前可見範圍</small>
+      </button>
+      <button id="capture-full">
+        <span>擷取完整網頁</span>
+        <small>自動捲動並拼接成整頁長圖（PNG / JPG）</small>
+      </button>
+    </section>
+
+    <section class="group">
+      <h2>轉為純文字</h2>
+      <button id="save-main-text">
+        <span>下載主要內容 TXT</span>
+        <small>優先擷取文章／主內容，減少選單雜訊</small>
+      </button>
+      <button id="save-all-text">
+        <span>下載全部文字 TXT</span>
+        <small>完整保留頁面可見文字</small>
+      </button>
+      <button id="copy-main-text">
+        <span>複製主要內容</span>
+        <small>直接貼到 ChatGPT、記事本或文件</small>
+      </button>
+      <button id="copy-onenote-text">
+        <span>複製到 OneNote（20pt）</span>
+        <small>貼到 OneNote 會保留 20pt 字體大小</small>
+      </button>
+    </section>
+
+    <label class="option">
+      <input id="include-meta" type="checkbox" checked>
+      <span>TXT 加入標題、網址與擷取時間</span>
+    </label>
+
+    <div id="progress" class="progress hidden">
+      <div class="progress-track"><div id="progress-bar"></div></div>
+      <span id="progress-text">處理中…</span>
+    </div>
+    <div id="status" class="status" role="status" aria-live="polite"></div>
+  </main>
+  <script src="popup.js"></script>
+</body>
+</html>
