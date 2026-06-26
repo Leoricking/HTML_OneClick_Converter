@@ -198,6 +198,18 @@ $("capture-visible").addEventListener("click", () => run(async () => {
   setStatus(`目前畫面 ${imageOptions.label} 已下載。`, "ok");
 }));
 
+
+$("save-page-pdf").addEventListener("click", () => run(async () => {
+  const tab = await getActiveTab();
+  await ensurePageAccess(tab);
+  setStatus("正在開啟 PDF 列印視窗…");
+  await chrome.scripting.executeScript({
+    target: { tabId: tab.id },
+    func: () => window.print()
+  });
+  setStatus("請在列印視窗將目的地設為「另存為 PDF」。", "ok");
+}));
+
 $("save-main-text").addEventListener("click", () => run(async () => {
   setStatus("正在擷取主要內容…");
   const { tab, data } = await extractText("main");
