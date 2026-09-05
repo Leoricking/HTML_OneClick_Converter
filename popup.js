@@ -265,15 +265,71 @@ $("capture-full").addEventListener("click", () => run(async () => {
         overflow: root.style.overflow
       };
       root.style.scrollBehavior = "auto";
-      const width = Math.max(root.scrollWidth, body?.scrollWidth || 0, root.clientWidth);
-      const height = Math.max(root.scrollHeight, body?.scrollHeight || 0, root.clientHeight);
-      window.__htmlConverterCaptureState = { original, hidden: [] };
-      window.scrollTo(0, 0);
+
+      const viewportWidth = window.innerWidth;
+      const viewportHeight = window.innerHeight;
+      const pageWidth = Math.max(root.scrollWidth, body?.scrollWidth || 0, root.clientWidth);
+      const pageHeight = Math.max(root.scrollHeight, body?.scrollHeight || 0, root.clientHeight);
+      const windowRange = Math.max(0, pageHeight - viewportHeight);
+
+      // SPA dashboards such as Garmin Connect often lock the document itself
+      // and place the actual page inside a large overflow:auto container.
+      // Find the dominant visible vertical scroller instead of assuming that
+      // document.scrollingElement always owns the page scroll.
+      let scroller = null;
+      let bestScore = 0;
+      for (const el of document.querySelectorAll("body *")) {
+        const style = getComputedStyle(el);
+        if (!/(auto|scroll|overlay)/.test(style.overflowY)) continue;
+        const range = el.scrollHeight - el.clientHeight;
+        if (range < 32 || el.clientHeight < viewportHeight * 0.3 ||
+            el.clientWidth < viewportWidth * 0.3) continue;
+        const rect = el.getBoundingClientRect();
+        const visibleWidth = Math.max(0, Math.min(rect.right, viewportWidth) - Math.max(rect.left, 0));
+        const visibleHeight = Math.max(0, Math.min(rect.bottom, viewportHeight) - Math.max(rect.top, 0));
+        if (visibleWidth < viewportWidth * 0.25 || visibleHeight < viewportHeight * 0.25) continue;
+        const visibleAreaRatio = (visibleWidth * visibleHeight) / (viewportWidth * viewportHeight);
+        const score = range * (0.5 + visibleAreaRatio);
+        if (score > bestScore) {
+          bestScore = score;
+          scroller = el;
+        }
+      }
+
+      const elementRange = scroller ? Math.max(0, scroller.scrollHeight - scroller.clientHeight) : 0;
+      const useElementScroller = Boolean(scroller &&
+        (windowRange < 32 || elementRange > windowRange * 1.15));
+      const activeScroller = useElementScroller ? scroller : null;
+      const scrollRange = activeScroller ? elementRange : windowRange;
+      const captureStepHeight = activeScroller ? activeScroller.clientHeight : viewportHeight;
+      const width = activeScroller ? viewportWidth : pageWidth;
+      const height = activeScroller ? viewportHeight + scrollRange : pageHeight;
+
+      const scrollerOriginal = activeScroller ? {
+        x: activeScroller.scrollLeft,
+        y: activeScroller.scrollTop,
+        behavior: activeScroller.style.scrollBehavior
+      } : null;
+      if (activeScroller) {
+        activeScroller.style.scrollBehavior = "auto";
+        activeScroller.scrollTo(0, 0);
+      } else {
+        window.scrollTo(0, 0);
+      }
+      window.__htmlConverterCaptureState = {
+        original,
+        scroller: activeScroller,
+        scrollerOriginal,
+        hidden: []
+      };
       return {
         width,
         height,
-        viewportWidth: window.innerWidth,
-        viewportHeight: window.innerHeight,
+        viewportWidth,
+        viewportHeight,
+        scrollRange,
+        captureStepHeight,
+        scrollMode: activeScroller ? "element" : "window",
         dpr: window.devicePixelRatio || 1
       };
     }
@@ -290,10 +346,18 @@ $("capture-full").addEventListener("click", () => run(async () => {
   }
 
   const steps = [];
-  for (let y = 0; y < info.height; y += info.viewportHeight) {
-    steps.push(Math.min(y, Math.max(0, info.height - info.viewportHeight)));
+  for (let y = 0; y <= info.scrollRange; y += info.captureStepHeight) {
+    steps.push(Math.min(y, info.scrollRange));
   }
+  if (!steps.length || steps.at(-1) !== info.scrollRange) steps.push(info.scrollRange);
   const uniqueSteps = [...new Set(steps)];
+  setProgress(
+    0,
+    uniqueSteps.length,
+    info.scrollMode === "element"
+      ? `已偵測內部捲動頁面，共 ${uniqueSteps.length} 段…`
+      : `已偵測一般網頁，共 ${uniqueSteps.length} 段…`
+  );
   const canvas = document.createElement("canvas");
   canvas.width = outputWidth;
   canvas.height = outputHeight;
@@ -310,22 +374,111 @@ $("capture-full").addEventListener("click", () => run(async () => {
         target: { tabId: tab.id },
         args: [y, i],
         func: async (targetY, index) => {
-          window.scrollTo(0, targetY);
-          await new Promise((resolve) => setTimeout(resolve, 350));
-          if (index === 1) {
-            const state = window.__htmlConverterCaptureState;
-            if (state) {
-              const nodes = [...document.querySelectorAll("body *")];
-              for (const el of nodes) {
-                const style = getComputedStyle(el);
-                if ((style.position === "fixed" || style.position === "sticky") &&
-                    el.offsetWidth > 0 && el.offsetHeight > 0) {
-                  state.hidden.push([el, el.style.getPropertyValue("visibility"), el.style.getPropertyPriority("visibility")]);
-                  el.style.setProperty("visibility", "hidden", "important");
+          const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+          const state = window.__htmlConverterCaptureState;
+          if (!state) return;
+          const scroller = state.scroller;
+          const setScrollY = (value) => {
+            if (scroller) scroller.scrollTo(0, value);
+            else window.scrollTo(0, value);
+          };
+          const getScrollY = () => scroller ? scroller.scrollTop : window.scrollY;
+
+          setScrollY(targetY);
+          await wait(350);
+          if (index === 0) return;
+
+          // Some sites do not expose their pinned header as a simple
+          // position:fixed/sticky node. Frameworks may move an ancestor with a
+          // transform or replace the header after scrolling. Detect both the
+          // declared CSS position and elements whose viewport coordinates stay
+          // unchanged during a small scroll probe.
+          const viewportWidth = window.innerWidth;
+          const viewportHeight = window.innerHeight;
+          const isVisible = (el, rect = el.getBoundingClientRect()) => {
+            const style = getComputedStyle(el);
+            return style.display !== "none" && style.visibility !== "hidden" &&
+              Number(style.opacity || 1) !== 0 && rect.width > 1 && rect.height > 1 &&
+              rect.right > 0 && rect.bottom > 0 &&
+              rect.left < viewportWidth && rect.top < viewportHeight;
+          };
+          const candidates = new Set();
+          const nodes = [...document.querySelectorAll("body *")];
+          const canHide = (el) => !scroller || (el !== scroller && !el.contains(scroller));
+
+          for (const el of nodes) {
+            const rect = el.getBoundingClientRect();
+            if (!isVisible(el, rect)) continue;
+            const position = getComputedStyle(el).position;
+            if (canHide(el) && (position === "fixed" || position === "sticky")) candidates.add(el);
+          }
+
+          const root = document.documentElement;
+          const body = document.body;
+          const maxScrollY = scroller
+            ? Math.max(0, scroller.scrollHeight - scroller.clientHeight)
+            : Math.max(root.scrollHeight, body?.scrollHeight || 0, root.clientHeight) - viewportHeight;
+          const baseY = getScrollY();
+          const probeY = baseY + 64 <= maxScrollY ? baseY + 64 : Math.max(0, baseY - 64);
+
+          if (Math.abs(probeY - baseY) >= 32) {
+            const before = new Map();
+            for (const el of nodes) {
+              const rect = el.getBoundingClientRect();
+              if (isVisible(el, rect)) before.set(el, { top: rect.top, left: rect.left });
+            }
+
+            setScrollY(probeY);
+            await wait(120);
+            const actualDelta = Math.abs(getScrollY() - baseY);
+
+            if (actualDelta >= 16) {
+              for (const [el, firstRect] of before) {
+                if (!el.isConnected) continue;
+                const secondRect = el.getBoundingClientRect();
+                if (!isVisible(el, secondRect)) continue;
+                if (canHide(el) && Math.abs(secondRect.top - firstRect.top) <= 3 &&
+                    Math.abs(secondRect.left - firstRect.left) <= 3) {
+                  candidates.add(el);
                 }
               }
             }
+
+            setScrollY(targetY);
+            await wait(180);
           }
+
+          // Re-scan after the probe because React/Vue pages may replace the
+          // navigation node while responding to scroll events.
+          for (const el of document.querySelectorAll("body *")) {
+            const rect = el.getBoundingClientRect();
+            if (!isVisible(el, rect)) continue;
+            const position = getComputedStyle(el).position;
+            if (canHide(el) && (position === "fixed" || position === "sticky")) candidates.add(el);
+          }
+
+          // Hide only the outermost matching containers. Hiding a parent also
+          // hides its logo/menu children and avoids excessive inline changes.
+          const outermost = [...candidates].filter((el) => {
+            for (let parent = el.parentElement; parent && parent !== body; parent = parent.parentElement) {
+              if (candidates.has(parent)) return false;
+            }
+            return true;
+          });
+
+          state.hiddenElements ||= new WeakSet();
+          for (const el of outermost) {
+            if (!el.isConnected || state.hiddenElements.has(el)) continue;
+            state.hidden.push([
+              el,
+              el.style.getPropertyValue("visibility"),
+              el.style.getPropertyPriority("visibility")
+            ]);
+            state.hiddenElements.add(el);
+            el.style.setProperty("visibility", "hidden", "important");
+          }
+
+          await wait(120);
         }
       });
 
@@ -386,6 +539,13 @@ async function restoreCaptureState(tabId) {
         }
         document.documentElement.style.scrollBehavior = state.original.behavior || "";
         document.documentElement.style.overflow = state.original.overflow || "";
+        if (state.scroller && state.scrollerOriginal) {
+          state.scroller.style.scrollBehavior = state.scrollerOriginal.behavior || "";
+          state.scroller.scrollTo(
+            state.scrollerOriginal.x || 0,
+            state.scrollerOriginal.y || 0
+          );
+        }
         window.scrollTo(state.original.x || 0, state.original.y || 0);
         delete window.__htmlConverterCaptureState;
       }

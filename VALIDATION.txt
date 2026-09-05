@@ -3,5 +3,14 @@ Validation report
 - manifest.json parses as valid JSON
 - popup.js syntax checked
 - Existing PNG/JPG, text, clipboard and OneNote features preserved
-- Added current-page PDF workflow through Chromium print dialog
+- Existing current-page PDF workflow through Chromium print dialog preserved
 - No new permissions required
+- Full-page capture keeps pinned elements in the first segment only
+- Later segments detect CSS fixed/sticky nodes on every capture step
+- Later segments also detect viewport-pinned containers by scroll-position probing
+- Hidden element visibility and original scroll position are restored in finally
+- Detects dominant visible overflow:auto/scroll containers used by SPA dashboards
+- Nested-scroller output height includes the container's complete scroll range
+- Nested-scroller capture steps use the container client height instead of window height
+- Window and nested-scroller modes share fixed/sticky duplicate suppression
+- Both window and nested scroller positions are restored after capture
