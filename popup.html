@@ -16,6 +16,106 @@
       </div>
     </header>
 
+    <section class="group clipper-group">
+      <h2>網頁剪藏</h2>
+
+      <label class="field">
+        <span>剪藏標題</span>
+        <input id="clip-title" type="text" maxlength="150" placeholder="自動使用目前網頁標題">
+      </label>
+
+      <label class="field">
+        <span>剪藏格式</span>
+        <select id="clip-mode">
+          <option value="article">整篇文章 HTML（保留排版）</option>
+          <option value="simplified">簡化文章 HTML（閱讀模式）</option>
+          <option value="full-mhtml">完整頁面 MHTML（含頁面資源）</option>
+          <option value="full-html">完整頁面 HTML 快照</option>
+          <option value="bookmark">書籤卡片 HTML</option>
+          <option value="element">手動點選網頁元素 HTML</option>
+          <option value="region">拖曳選取區域截圖</option>
+        </select>
+        <small id="clip-mode-help" class="field-help"></small>
+      </label>
+
+      <label class="field">
+        <span>輸出目標</span>
+        <select id="clip-target">
+          <option value="both" selected>下載＋傳送到 OneNote</option>
+          <option value="onenote">只傳送到 OneNote</option>
+          <option value="download">只下載到電腦</option>
+        </select>
+      </label>
+
+      <div id="onenote-settings">
+        <label class="field">
+          <span>OneNote 傳送方式</span>
+          <select id="onenote-mode">
+            <option value="clipboard" selected>複製後貼上（免登入）</option>
+            <option value="direct">直接建立頁面（Microsoft 登入）</option>
+          </select>
+          <small id="onenote-mode-help" class="field-help"></small>
+        </label>
+
+        <div id="onenote-direct-panel" class="direct-panel hidden">
+          <label class="field">
+            <span>Microsoft Entra 應用程式 Client ID</span>
+            <input id="onenote-client-id" type="text" inputmode="text" autocomplete="off" placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx">
+          </label>
+          <label class="field">
+            <span>Redirect URI（請加入 Entra 的 SPA Redirect URI）</span>
+            <div class="inline-field">
+              <input id="onenote-redirect-uri" type="text" readonly>
+              <button id="copy-redirect-uri" type="button" class="compact">複製</button>
+            </div>
+          </label>
+          <div class="button-row">
+            <button id="onenote-sign-in" type="button"><span>登入 Microsoft</span></button>
+            <button id="onenote-refresh" type="button"><span>重新整理</span></button>
+            <button id="onenote-sign-out" type="button"><span>登出</span></button>
+          </div>
+          <p id="onenote-auth-status" class="auth-status">尚未登入。</p>
+          <label class="field">
+            <span>OneNote 筆記本</span>
+            <select id="onenote-notebook"><option value="">請先登入 Microsoft</option></select>
+          </label>
+          <label class="field">
+            <span>OneNote 節區</span>
+            <select id="onenote-section"><option value="">請先選擇筆記本</option></select>
+          </label>
+          <small class="field-help">第一次使用請依 README 完成一次 Microsoft Entra 設定；不需要 Client Secret。</small>
+        </div>
+      </div>
+
+      <div class="field-grid">
+        <label class="field">
+          <span>下載分類</span>
+          <input id="clip-notebook" type="text" maxlength="80" placeholder="未分類">
+        </label>
+        <label class="field">
+          <span>標籤</span>
+          <input id="clip-tags" type="text" maxlength="300" placeholder="跑步, 賽事, 待確認">
+        </label>
+      </div>
+
+      <label class="field">
+        <span>備註</span>
+        <textarea id="clip-note" rows="2" maxlength="2000" placeholder="加入這次剪藏的備註（可留空）"></textarea>
+      </label>
+
+      <div class="clip-actions">
+        <button id="preview-web-clip" type="button">
+          <span>預覽剪藏效果</span>
+          <small>在原網頁標示本次會擷取的範圍</small>
+        </button>
+        <button id="save-web-clip" class="clip-primary">
+          <span>開始剪藏</span>
+          <small>依照上方設定處理目前網頁</small>
+        </button>
+      </div>
+      <p class="privacy-note">剪貼簿模式只在本機處理；直接建立頁面模式只將本次剪藏內容傳送至 Microsoft Graph／OneNote。</p>
+    </section>
+
     <section class="group">
       <h2>轉為圖片</h2>
 
@@ -76,6 +176,7 @@
     </div>
     <div id="status" class="status" role="status" aria-live="polite"></div>
   </main>
+  <script src="onenote.js"></script>
   <script src="popup.js"></script>
 </body>
 </html>

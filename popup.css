@@ -7,12 +7,14 @@
   --line: #dde3ee;
   --accent: #315efb;
   --accent-hover: #2448c9;
+  --clip: #00a82d;
+  --clip-hover: #008f26;
   --ok: #137a46;
   --error: #bd2c2c;
 }
 * { box-sizing: border-box; }
 body {
-  width: 340px;
+  width: 390px;
   margin: 0;
   background: var(--bg);
   color: var(--text);
@@ -71,6 +73,60 @@ select {
   color: var(--text);
   font: inherit;
 }
+input, textarea {
+  width: 100%;
+  padding: 9px 10px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: var(--card);
+  color: var(--text);
+  font: inherit;
+}
+textarea { resize: vertical; min-height: 56px; }
+input:focus, textarea:focus, select:focus {
+  outline: 2px solid rgba(49, 94, 251, .22);
+  border-color: var(--accent);
+}
+.field-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+.field-help {
+  display: block;
+  margin-top: 4px;
+  color: var(--muted);
+  font-size: 11px;
+}
+.clipper-group { border-color: #a8dcb6; }
+.clipper-group h2 { color: var(--clip); }
+.direct-panel {
+  margin: 7px 0 10px;
+  padding: 9px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: rgba(49, 94, 251, .035);
+}
+.inline-field { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 6px; }
+button.compact { width: auto; margin: 0; padding: 8px 10px; text-align: center; }
+.button-row { display: grid; grid-template-columns: 1.25fr 1fr .75fr; gap: 6px; }
+.button-row button { margin: 0; padding: 8px 6px; text-align: center; }
+.button-row button span { font-size: 11px; }
+.auth-status { margin: 7px 1px; color: var(--muted); font-size: 11px; }
+.auth-status.ok { color: var(--ok); }
+.auth-status.error { color: var(--error); }
+.clip-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 7px; }
+button.clip-primary {
+  border-color: var(--clip);
+  background: var(--clip);
+  color: white;
+}
+button.clip-primary:hover { background: var(--clip-hover); border-color: var(--clip-hover); }
+.privacy-note {
+  margin: 6px 2px 0;
+  color: var(--muted);
+  font-size: 10px;
+}
 button {
   width: 100%;
   margin: 5px 0;
@@ -84,7 +140,7 @@ button {
   transition: border-color .15s, transform .15s, background .15s;
 }
 button:hover { border-color: var(--accent); transform: translateY(-1px); }
-button:disabled, select:disabled { opacity: .55; cursor: wait; transform: none; }
+button:disabled, select:disabled, input:disabled, textarea:disabled { opacity: .55; cursor: wait; transform: none; }
 button.primary {
   border-color: var(--accent);
   background: var(--accent);
@@ -124,6 +180,7 @@ button small { display: block; margin-top: 2px; opacity: .72; font-size: 11px; }
   :root {
     --bg: #151821; --card: #202530; --text: #edf1f7;
     --muted: #a9b2c3; --line: #384152; --accent: #6787ff;
-    --accent-hover: #5575ec; --ok: #58d495; --error: #ff7777;
+    --accent-hover: #5575ec; --clip: #35d15b; --clip-hover: #27b94b;
+    --ok: #58d495; --error: #ff7777;
   }
 }

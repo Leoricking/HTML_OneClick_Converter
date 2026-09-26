@@ -1,10 +1,16 @@
 Validation report
 =================
+- v2.3.1 simplified reader selection actions only copy/save highlighted content
+- v2.3.0 simplified reader adds an independent whole-article clipping action
+- v2.2.0 element picker locks the selection before save
+- Element picker provides in-page Save, Reselect and Cancel controls
+- Simplified reading preview renders cleaned selectable content in an interactive overlay
+- Simplified preview supports text selection, rich copy and direct save
 - manifest.json parses as valid JSON
 - popup.js syntax checked
 - Existing PNG/JPG, text, clipboard and OneNote features preserved
 - Existing current-page PDF workflow through Chromium print dialog preserved
-- No new permissions required
+- Added pageCapture for MHTML and clipboardWrite for user-triggered OneNote transfer
 - Full-page capture keeps pinned elements in the first segment only
 - Later segments detect CSS fixed/sticky nodes on every capture step
 - Later segments also detect viewport-pinned containers by scroll-position probing
@@ -14,3 +20,22 @@ Validation report
 - Nested-scroller capture steps use the container client height instead of window height
 - Window and nested-scroller modes share fixed/sticky duplicate suppression
 - Both window and nested scroller positions are restored after capture
+- v2.1.0 webpage clipping module added without third-party branding
+- Smart article HTML and simplified article HTML added
+- Full DOM HTML snapshot and Chromium MHTML capture added
+- Bookmark card HTML added
+- Interactive element picker with Escape cancellation added
+- Interactive visible-region PNG/JPG crop with Escape cancellation added
+- Notebook folder, tags, note, title and source metadata added
+- Region screenshots include a metadata TXT sidecar
+- Clip destination supports download, OneNote clipboard, or both
+- Article, simplified article, HTML snapshot, bookmark and selected element use rich HTML clipboard data
+- Selected region uses PNG clipboard data for direct OneNote paste
+- MHTML can download while a OneNote-compatible editable article is copied
+- OneNote supports clipboard paste and Microsoft Graph direct-page modes
+- Microsoft sign-in uses authorization code flow with PKCE and no client secret
+- Notebook and section selectors are populated from the signed-in OneNote account
+- Clip preview overlays are available for every clipping format
+- background.js syntax checked
+- Existing image, PDF, TXT, clipboard, OneNote and full-page functions preserved
+- New permissions are limited to pageCapture, clipboardWrite and identity for user-triggered actions
