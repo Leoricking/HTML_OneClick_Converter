@@ -109,9 +109,12 @@ async function saveSelectedRegion(message, sender) {
   const tab = sender.tab;
   if (!tab?.windowId) throw new Error("找不到來源分頁視窗。");
   const options = message.options || {};
-  const format = options.imageFormat === "jpg" ? "jpeg" : "png";
-  const captureOptions = { format };
-  if (format === "jpeg") captureOptions.quality = 92;
+  // Capture losslessly first. OneNote's clipboard and Graph paths always get
+  // the original PNG pixels; JPG is generated separately only for a requested
+  // file download, so a JPG setting cannot blur the image pasted into OneNote.
+  const requestedDownloadFormat = options.imageFormat === "jpg" ? "jpeg" : "png";
+  const captureFormat = "png";
+  const captureOptions = { format: captureFormat };
   const dataUrl = await captureVisibleTabCompat(tab.windowId, captureOptions);
   const sourceBlob = await (await fetch(dataUrl)).blob();
   const bitmap = await createImageBitmap(sourceBlob);
@@ -123,37 +126,31 @@ async function saveSelectedRegion(message, sender) {
   const sw = Math.max(1, Math.min(bitmap.width - sx, Math.round((Number(rect.width) || 1) * scaleX)));
   const sh = Math.max(1, Math.min(bitmap.height - sy, Math.round((Number(rect.height) || 1) * scaleY)));
   const canvas = new OffscreenCanvas(sw, sh);
-  const context = canvas.getContext("2d", { alpha: format !== "jpeg" });
-  if (format === "jpeg") {
-    context.fillStyle = "#ffffff";
-    context.fillRect(0, 0, sw, sh);
-  }
+  const context = canvas.getContext("2d", { alpha: true });
   context.drawImage(bitmap, sx, sy, sw, sh, 0, 0, sw, sh);
   bitmap.close();
-  const outputBlob = await canvas.convertToBlob({
-    type: format === "jpeg" ? "image/jpeg" : "image/png",
-    quality: format === "jpeg" ? 0.92 : undefined
-  });
-  const extension = format === "jpeg" ? "jpg" : "png";
+  const pngBlob = await canvas.convertToBlob({ type: "image/png" });
+  const shouldDownload = options.target !== "onenote" || Boolean(message.forceDownload);
+  const shouldCreateOneNote = options.target !== "download" && options.oneNoteMode === "direct" && !message.forceDownload;
+  const useJpgForDownload = shouldDownload && requestedDownloadFormat === "jpeg" && !(message.forceDownload && options.target === "onenote");
+  const extension = useJpgForDownload ? "jpg" : "png";
+  const outputBlob = useJpgForDownload
+    ? await canvas.convertToBlob({ type: "image/jpeg", quality: 0.92 })
+    : pngBlob;
   const title = safeFilename(options.title, tab.title || "selected-region");
   const stamp = timestamp();
   const filename = `${clipFolder(options)}/${title}_${stamp}_選取區域.${extension}`;
-  const shouldDownload = options.target !== "onenote" || Boolean(message.forceDownload);
-  const shouldCreateOneNote = options.target !== "download" && options.oneNoteMode === "direct" && !message.forceDownload;
   if (shouldDownload) {
     await downloadBlob(outputBlob, filename);
     const metadataBlob = new Blob(["\uFEFF", metadataText(options)], { type: "text/plain;charset=utf-8" });
     await downloadBlob(metadataBlob, `${clipFolder(options)}/${title}_${stamp}_剪藏資訊.txt`);
   }
   if (shouldCreateOneNote) {
-    await OneNoteClient.createImagePage(options.oneNoteSectionId, outputBlob, options);
+    await OneNoteClient.createImagePage(options.oneNoteSectionId, pngBlob, options);
   }
   let clipboardDataUrl = "";
   if (options.target !== "download" && options.oneNoteMode !== "direct" && !message.forceDownload) {
-    const clipboardBlob = format === "png"
-      ? outputBlob
-      : await canvas.convertToBlob({ type: "image/png" });
-    clipboardDataUrl = await blobToDataUrl(clipboardBlob);
+    clipboardDataUrl = await blobToDataUrl(pngBlob);
   }
   return {
     ok: true,

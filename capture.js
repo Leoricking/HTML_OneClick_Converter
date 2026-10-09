@@ -107,6 +107,70 @@
       sendProgress(jobId, { done: 0, total: uniqueSteps.length, message: `已偵測${scrollDescription}，可捲動 ${Math.round(scrollRange)} px，共 ${uniqueSteps.length} 段…` },
         `已啟動完整頁面截圖：${scrollDescription}，${uniqueSteps.length} 段（${imageOptions.label}）；可關閉擴充功能視窗。`);
 
+      const isVisible = (el, rect = el.getBoundingClientRect()) => {
+        const style = getComputedStyle(el);
+        return style.display !== "none" && style.visibility !== "hidden" && Number(style.opacity || 1) !== 0 &&
+          rect.width > 1 && rect.height > 1 && rect.right > 0 && rect.bottom > 0 &&
+          rect.left < viewportWidth && rect.top < viewportHeight;
+      };
+      // Detect the complete edge sidebar, not just its outer fixed element.
+      // Frameworks may mark inner controls/containers fixed or sticky too; if
+      // those descendants are hidden independently, labels remain but inputs
+      // disappear in stitched segments.
+      const isSidebarIdentity = (el) => {
+        const identity = `${el.id || ""} ${el.className?.baseVal || el.className || ""} ${el.getAttribute?.("aria-label") || ""} ${el.getAttribute?.("data-testid") || ""}`;
+        return /sidebar|side[-_ ]?panel|sidenav/i.test(identity);
+      };
+      const isPersistentSidePanel = (el, rect = el.getBoundingClientRect()) => {
+        const style = getComputedStyle(el);
+        const edge = rect.left <= 8 || rect.right >= viewportWidth - 8;
+        const narrow = rect.width <= Math.max(520, viewportWidth * 0.42);
+        const tall = rect.height >= viewportHeight * 0.35;
+        return edge && narrow && tall && (isSidebarIdentity(el) || style.position === "fixed" || style.position === "sticky");
+      };
+      const sidebarCandidates = [...document.querySelectorAll("body *")]
+        .filter((el) => isVisible(el) && isPersistentSidePanel(el));
+      const persistentSidePanelRoots = sidebarCandidates.filter((el) => {
+        for (let parent = el.parentElement; parent && parent !== body; parent = parent.parentElement) {
+          if (sidebarCandidates.includes(parent)) return false;
+        }
+        return true;
+      });
+      const persistentSidePanelRegions = persistentSidePanelRoots.map((el) => {
+        const rect = el.getBoundingClientRect();
+        let backgroundColor = "#ffffff";
+        for (let node = el; node && node !== body; node = node.parentElement) {
+          const candidate = getComputedStyle(node).backgroundColor;
+          if (candidate && candidate !== "transparent" && !/^rgba\([^)]*,\s*0\s*\)$/i.test(candidate)) {
+            backgroundColor = candidate;
+            break;
+          }
+        }
+        const panelLeft = Math.max(0, rect.left);
+        const panelRight = Math.min(viewportWidth, rect.right);
+        const scrollCandidates = [el, ...el.querySelectorAll("*")].filter((node) => {
+          if (node === activeScroller) return false;
+          const style = getComputedStyle(node);
+          const range = node.scrollHeight - node.clientHeight;
+          return /(auto|scroll|overlay|hidden)/.test(style.overflowY) && range > 32 &&
+            node.clientHeight >= viewportHeight * 0.3 && node.clientWidth >= (panelRight - panelLeft) * 0.55;
+        });
+        scrollCandidates.sort((a, b) =>
+          (b.scrollHeight - b.clientHeight) * b.clientWidth - (a.scrollHeight - a.clientHeight) * a.clientWidth
+        );
+        const panelScroller = scrollCandidates[0] || null;
+        return {
+          left: panelLeft,
+          right: panelRight,
+          backgroundColor,
+          scroller: panelScroller,
+          scrollRange: panelScroller ? Math.max(0, panelScroller.scrollHeight - panelScroller.clientHeight) : 0,
+          contentHeight: panelScroller ? panelScroller.scrollHeight : viewportHeight,
+          originalScrollTop: panelScroller ? panelScroller.scrollTop : 0,
+          originalScrollBehavior: panelScroller?.style.scrollBehavior || ""
+        };
+      }).filter((panel) => panel.right > panel.left);
+      const isInsidePersistentSidePanel = (el) => persistentSidePanelRoots.some((rootEl) => rootEl === el || rootEl.contains(el));
       canvas = document.createElement("canvas");
       canvas.width = outputWidth;
       canvas.height = outputHeight;
@@ -114,6 +178,11 @@
       if (!ctx) throw new Error("無法建立截圖拼接畫布。");
       ctx.fillStyle = "#ffffff";
       ctx.fillRect(0, 0, outputWidth, outputHeight);
+      const outputScaleX = outputWidth / Math.max(1, viewportWidth);
+      for (const panel of persistentSidePanelRegions) {
+        ctx.fillStyle = panel.backgroundColor;
+        ctx.fillRect(panel.left * outputScaleX, 0, (panel.right - panel.left) * outputScaleX, outputHeight);
+      }
 
       const setScrollY = (value) => activeScroller ? activeScroller.scrollTo(0, value) : window.scrollTo(0, value);
       const getScrollY = () => activeScroller ? activeScroller.scrollTop : window.scrollY;
@@ -141,20 +210,19 @@
         }
         await sleep(100);
       };
-      const isVisible = (el, rect = el.getBoundingClientRect()) => {
-        const style = getComputedStyle(el);
-        return style.display !== "none" && style.visibility !== "hidden" && Number(style.opacity || 1) !== 0 &&
-          rect.width > 1 && rect.height > 1 && rect.right > 0 && rect.bottom > 0 &&
-          rect.left < viewportWidth && rect.top < viewportHeight;
-      };
-      const canHide = (el) => !activeScroller || (el !== activeScroller && !el.contains(activeScroller));
+      const canHide = (el) => (!activeScroller || (el !== activeScroller && !el.contains(activeScroller))) &&
+        !isInsidePersistentSidePanel(el);
+      for (const panel of persistentSidePanelRegions) {
+        if (!panel.scroller) continue;
+        panel.scroller.style.scrollBehavior = "auto";
+        panel.scroller.scrollTop = 0;
+      }
 
       for (let i = 0; i < uniqueSteps.length; i++) {
         const y = uniqueSteps[i];
         sendProgress(jobId, { done: i, total: uniqueSteps.length, message: `擷取第 ${i + 1} / ${uniqueSteps.length} 段…` },
           `正在擷取完整網頁（${imageOptions.label}）…`);
         await scrollToAndWait(y);
-
         if (i > 0) {
           const nodes = [...document.querySelectorAll("body *")];
           const candidates = new Set();
@@ -162,7 +230,7 @@
             const rect = el.getBoundingClientRect();
             if (!isVisible(el, rect)) continue;
             const pos = getComputedStyle(el).position;
-            if (canHide(el) && (pos === "fixed" || pos === "sticky")) candidates.add(el);
+            if (canHide(el) && (pos === "fixed" || pos === "sticky") && !isPersistentSidePanel(el, rect)) candidates.add(el);
           }
           const maxScrollY = activeScroller
             ? Math.max(0, activeScroller.scrollHeight - activeScroller.clientHeight)
@@ -181,7 +249,7 @@
               for (const [el, firstRect] of before) {
                 if (!el.isConnected) continue;
                 const rect = el.getBoundingClientRect();
-                if (isVisible(el, rect) && canHide(el) && Math.abs(rect.top - firstRect.top) <= 3 && Math.abs(rect.left - firstRect.left) <= 3) candidates.add(el);
+                if (isVisible(el, rect) && canHide(el) && !isPersistentSidePanel(el, rect) && Math.abs(rect.top - firstRect.top) <= 3 && Math.abs(rect.left - firstRect.left) <= 3) candidates.add(el);
               }
             }
             setScrollY(y);
@@ -189,7 +257,7 @@
           }
           for (const el of document.querySelectorAll("body *")) {
             const rect = el.getBoundingClientRect();
-            if (isVisible(el, rect) && canHide(el) && ["fixed", "sticky"].includes(getComputedStyle(el).position)) candidates.add(el);
+            if (isVisible(el, rect) && canHide(el) && ["fixed", "sticky"].includes(getComputedStyle(el).position) && !isPersistentSidePanel(el, rect)) candidates.add(el);
           }
           const outermost = [...candidates].filter((el) => {
             for (let parent = el.parentElement; parent && parent !== body; parent = parent.parentElement) {
@@ -219,8 +287,65 @@
         const sourceCssHeight = image.height / dpr;
         const drawCssHeight = Math.min(sourceCssHeight, height - y);
         const sourcePixelHeight = Math.round(drawCssHeight * dpr);
-        ctx.drawImage(image, 0, 0, image.width, sourcePixelHeight, 0, Math.round(y * dpr), outputWidth, sourcePixelHeight);
+        const destinationY = Math.round(y * dpr);
+        if (persistentSidePanelRegions.length === 0) {
+          ctx.drawImage(image, 0, 0, image.width, sourcePixelHeight, 0, destinationY, outputWidth, sourcePixelHeight);
+        } else {
+          // Keep fixed panels out of page segments. They are captured and
+          // stitched in a separate pass below using their own scroll range.
+          ctx.save();
+          ctx.beginPath();
+          ctx.rect(0, destinationY, outputWidth, sourcePixelHeight);
+          for (const panel of persistentSidePanelRegions) {
+            ctx.rect(panel.left * outputScaleX, destinationY, (panel.right - panel.left) * outputScaleX, sourcePixelHeight);
+          }
+          ctx.clip("evenodd");
+          ctx.drawImage(image, 0, 0, image.width, sourcePixelHeight, 0, destinationY, outputWidth, sourcePixelHeight);
+          ctx.restore();
+        }
         image.close?.();
+      }
+
+      if (persistentSidePanelRegions.length) {
+        const panelPassHeight = Math.max(...persistentSidePanelRegions.map((panel) => panel.contentHeight));
+        const panelSteps = [];
+        for (let y = 0; y < panelPassHeight; y += viewportHeight) panelSteps.push(y);
+        await scrollToAndWait(0);
+        sendProgress(jobId, { done: 0, total: panelSteps.length, message: `正在完整拼接左側欄（${panelSteps.length} 段）…` },
+          "正在獨立擷取側欄內容；完成後會接續產生完整網頁圖片…");
+        for (let index = 0; index < panelSteps.length; index++) {
+          const panelY = panelSteps[index];
+          for (const panel of persistentSidePanelRegions) {
+            if (panel.scroller) panel.scroller.scrollTop = Math.min(panelY, panel.scrollRange);
+          }
+          if (persistentSidePanelRegions.some((panel) => panel.scroller)) await sleep(200);
+          await sleep(550);
+          const captureOptions = { format: imageOptions.captureFormat };
+          if (imageOptions.captureFormat === "jpeg") captureOptions.quality = imageOptions.quality;
+          const captured = await chrome.runtime.sendMessage({
+            type: "capture-full-page-segment", jobId, windowId, options: captureOptions
+          });
+          if (!captured?.ok || !captured.dataUrl) throw new Error(captured?.message || "瀏覽器沒有回傳側欄截圖片段。");
+          const image = await loadImage(captured.dataUrl);
+          const sourceScaleX = image.width / Math.max(1, viewportWidth);
+          const sourceScaleY = image.height / Math.max(1, viewportHeight);
+          for (const panel of persistentSidePanelRegions) {
+            const panelScrollTop = Math.min(panelY, panel.scrollRange);
+            const sourceTopCss = panelY - panelScrollTop;
+            const drawHeightCss = Math.min(viewportHeight - sourceTopCss, panel.contentHeight - panelY);
+            if (drawHeightCss <= 0) continue;
+            ctx.drawImage(
+              image,
+              panel.left * sourceScaleX, sourceTopCss * sourceScaleY,
+              (panel.right - panel.left) * sourceScaleX, drawHeightCss * sourceScaleY,
+              panel.left * outputScaleX, panelY * dpr,
+              (panel.right - panel.left) * outputScaleX, drawHeightCss * dpr
+            );
+          }
+          image.close?.();
+          sendProgress(jobId, { done: index + 1, total: panelSteps.length, message: `側欄第 ${index + 1} / ${panelSteps.length} 段已拼接` },
+            "正在拼接側欄內容…");
+        }
       }
 
       sendProgress(jobId, { done: uniqueSteps.length, total: uniqueSteps.length, message: `正在產生 ${imageOptions.label}…` }, "正在產生完整網頁圖片…");
@@ -237,6 +362,11 @@
         if (!el?.style) continue;
         if (value) el.style.setProperty("visibility", value, priority || "");
         else el.style.removeProperty("visibility");
+      }
+      for (const panel of persistentSidePanelRegions) {
+        if (!panel.scroller) continue;
+        panel.scroller.style.scrollBehavior = panel.originalScrollBehavior;
+        panel.scroller.scrollTop = panel.originalScrollTop;
       }
       root.style.scrollBehavior = original.behavior || "";
       root.style.overflow = original.overflow || "";

@@ -1,5 +1,15 @@
 Validation report
 =================
+- v2.4.5 captures page and fixed sidebar in independent passes to avoid scroll-coordinate crop/blank gaps
+- v2.4.5 stitches sidebar content from its own top and scroll range exactly once, then restores original positions
+- v2.4.4 synchronizes independently scrollable fixed sidebars with page Y and restores their original scroll position
+- v2.4.4 draws only the sidebar content corresponding to each output Y range, preventing both clipping and repeated controls
+- v2.4.3 initializes detected sidebar regions before canvas rendering; regression test verifies declaration/use order
+- v2.4.3 preserves v2.4.2 single-instance sidebar stitching and background capture
+- v2.4.2 draws fixed sidebar UI only in the first segment and preserves its background below without repeating controls
+- v2.4.1 excludes the full persistent sidebar subtree from sticky-element hiding
+- v2.4.0 preserves fixed edge sidebars during stitched full-page capture
+- v2.4.0 captures selected regions losslessly as PNG for clipboard/OneNote, while JPG applies only to downloaded files
 - v2.3.9 detects programmatically scrollable overflow:hidden containers used by SPA pages
 - v2.3.9 verifies each target scroll position and aborts rather than silently capturing the same viewport repeatedly
 - v2.3.9 reports detected scroll mode, scroll range, and segment count

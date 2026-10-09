@@ -6,7 +6,7 @@ const root = path.resolve(__dirname, "..");
 const read = (name) => fs.readFileSync(path.join(root, name), "utf8");
 
 const manifest = JSON.parse(read("manifest.json"));
-if (manifest.version !== "2.3.9") throw new Error("manifest version must be 2.3.9");
+if (manifest.version !== "2.4.5") throw new Error("manifest version must be 2.4.2");
 for (const permission of ["activeTab", "scripting", "downloads", "storage", "pageCapture", "clipboardWrite", "identity"]) {
   if (!manifest.permissions.includes(permission)) throw new Error(`missing permission: ${permission}`);
 }
@@ -17,6 +17,7 @@ if (manifest.background?.service_worker !== "background.js") throw new Error("ba
 
 const html = read("popup.html");
 const popupSource = read("popup.js");
+const backgroundSource = read("background.js");
 const captureSource = read("capture.js");
 const htmlIds = new Set([...html.matchAll(/\bid="([^"]+)"/g)].map((match) => match[1]));
 const referencedIds = new Set([...popupSource.matchAll(/\$\("([^"]+)"\)/g)].map((match) => match[1]));
@@ -92,8 +93,12 @@ const backgroundContext = {
   crypto: require("crypto").webcrypto,
   btoa,
   fetch,
-  createImageBitmap: async () => ({}),
-  OffscreenCanvas: class {},
+  createImageBitmap: async () => ({ width: 200, height: 100, close() {} }),
+  OffscreenCanvas: class {
+    constructor(width, height) { this.width = width; this.height = height; this.types = []; }
+    getContext() { return { drawImage() {}, fillRect() {} }; }
+    async convertToBlob(options) { this.types.push(options.type); return new Blob(["test-image"], { type: options.type }); }
+  },
   setTimeout,
   clearTimeout,
   chrome: {
@@ -107,7 +112,10 @@ const backgroundContext = {
     } },
     tabs: {
       query: async () => [{ id: 1, windowId: 1 }],
-      captureVisibleTab: async () => "data:image/png;base64,dGVzdA=="
+      captureVisibleTab: async (_windowId, options) => {
+        backgroundContext.lastSegmentCaptureOptions = options;
+        return "data:image/png;base64,dGVzdA==";
+      }
     }
   }
 };
@@ -132,8 +140,19 @@ for (const name of ["popup.html", "popup.js", "popup.css", "README.md", "VALIDAT
   if (!popupSource.includes('files: ["capture.js"]') || !popupSource.includes('type: "start-full-page-capture"')) {
     throw new Error("full-page capture is not dispatched to the persistent tab content script");
   }
-  for (const marker of ["capture-full-page-segment", "begin-full-page-download", "append-full-page-download", "finish-full-page-download", 'behavior: "smooth"', "scrollToAndWait(y)", "overlay|hidden", "網頁沒有捲動到第", "finally", "window.scrollTo(original.x"]) {
+  if (captureSource.indexOf("const persistentSidePanelRegions =") > captureSource.indexOf("for (const panel of persistentSidePanelRegions)")) {
+    throw new Error("sidebar regions must be initialized before canvas background rendering");
+  }
+  if (captureSource.includes("(panelY + sourceTopCss) * dpr")) throw new Error("sidebar source crop offset must not be added to its destination Y");
+  for (const marker of ["capture-full-page-segment", "begin-full-page-download", "append-full-page-download", "finish-full-page-download", 'behavior: "smooth"', "scrollToAndWait(y)", "overlay|hidden", "網頁沒有捲動到第", "persistentSidePanelRoots", "persistentSidePanelRegions", "isInsidePersistentSidePanel", "scrollCandidates", "panelSteps", "const panelY = panelSteps[index]", "panel.scroller.scrollTop = Math.min(panelY, panel.scrollRange)", "panel.contentHeight - panelY", "panelY * dpr", "panel.originalScrollTop", "!isInsidePersistentSidePanel(el)", 'ctx.clip("evenodd")', "panel.scroller.scrollTop = 0", "finally", "window.scrollTo(original.x"]) {
     if (!captureSource.includes(marker)) throw new Error(`background-safe capture feature missing: ${marker}`);
+  }
+  if (!backgroundSource.includes('const captureFormat = "png"') || !backgroundSource.includes('createImagePage(options.oneNoteSectionId, pngBlob')) {
+    throw new Error("OneNote image path must preserve the lossless PNG source");
+  }
+  const clipboardImage = await vm.runInContext(`saveSelectedRegion({rect:{x:0,y:0,width:50,height:40},viewportWidth:100,viewportHeight:50,options:{imageFormat:"jpg",target:"onenote",oneNoteMode:"clipboard"}},{tab:{id:1,windowId:1,title:"Test"}})`, backgroundContext);
+  if (backgroundContext.lastSegmentCaptureOptions?.format !== "png" || !clipboardImage.clipboardDataUrl.startsWith("data:image/png;base64,")) {
+    throw new Error("OneNote clipboard capture must remain full-resolution PNG when JPG is selected");
   }
   const captureReply = await new Promise((resolve, reject) => {
     const keepAlive = messageListener({ type: "capture-full-page-segment", options: { format: "png" } }, { tab: { id: 1, windowId: 1 } }, resolve);
@@ -155,7 +174,7 @@ for (const name of ["popup.html", "popup.js", "popup.css", "README.md", "VALIDAT
   if (!downloadReply?.ok || downloadReply.downloadId !== 1 || backgroundContext.downloadRequests.at(-1)?.url !== payload) {
     throw new Error("automatic background image download integration failed");
   }
-  console.log("Smoke tests passed: v2.3.9 nested scroll detection, verified segment scrolling, chunked transfer, automatic download, clipping, and OneNote");
+  console.log("Smoke tests passed: v2.4.5 independent sidebar stitching, verified segment scrolling, lossless OneNote PNG, chunked transfer, automatic download, clipping, and OneNote");
 })().catch((error) => {
   console.error(error);
   process.exitCode = 1;
