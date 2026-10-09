@@ -1,5 +1,14 @@
 Validation report
 =================
+- v2.5.0 captures full-page screenshots in small scroll steps and writes only contiguous uncovered strips
+- v2.5.0 checks final stitched coverage and cancels the download if any page-height region is missing
+- v2.4.9 never hides page elements during full-page screenshot stitching, preventing positioned/virtualized rows from disappearing
+- v2.4.9 retains overlapping segments, sidebar pass, scroll validation, state restoration, and automatic download
+- v2.4.8 removes scroll-coordinate guessing that could hide static siblings of a nested scroller
+- v2.4.8 preserves sticky elements and content-rich tables, charts, images, and media during stitching
+- v2.4.7 full-page screenshot segments overlap by 30% to reduce missing dynamic table rows at seams
+- v2.4.6 protects fixed sidebars and their ancestor shells from sticky-element hiding
+- v2.4.6 keeps sidebar state available to finally so original sidebar scroll is restored
 - v2.4.5 captures page and fixed sidebar in independent passes to avoid scroll-coordinate crop/blank gaps
 - v2.4.5 stitches sidebar content from its own top and scroll range exactly once, then restores original positions
 - v2.4.4 synchronizes independently scrollable fixed sidebars with page Y and restores their original scroll position
@@ -33,13 +42,12 @@ Validation report
 - Existing current-page PDF workflow through Chromium print dialog preserved
 - Added pageCapture for MHTML and clipboardWrite for user-triggered OneNote transfer
 - Full-page capture keeps pinned elements in the first segment only
-- Later segments detect CSS fixed/sticky nodes on every capture step
-- Later segments also detect viewport-pinned containers by scroll-position probing
+- Later segments suppress only small, explicitly fixed UI chrome; data-rich and sticky content is preserved
 - Hidden element visibility and original scroll position are restored in finally
 - Detects dominant visible overflow:auto/scroll containers used by SPA dashboards
 - Nested-scroller output height includes the container's complete scroll range
 - Nested-scroller capture steps use the container client height instead of window height
-- Window and nested-scroller modes share fixed/sticky duplicate suppression
+- Window and nested-scroller modes share conservative fixed-UI suppression
 - Both window and nested scroller positions are restored after capture
 - v2.1.0 webpage clipping module added without third-party branding
 - Smart article HTML and simplified article HTML added

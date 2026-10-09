@@ -42,10 +42,10 @@
       behavior: root.style.scrollBehavior,
       overflow: root.style.overflow
     };
-    const hidden = [];
     let activeScroller = null;
     let scrollerOriginal = null;
     let canvas = null;
+    let persistentSidePanelRegions = [];
     try {
       sendProgress(jobId, { done: 0, total: 1, message: "分析頁面尺寸…" }, `正在準備完整網頁截圖（${imageOptions.label}）…`);
       root.style.scrollBehavior = "auto";
@@ -80,6 +80,11 @@
       activeScroller = scroller && (windowRange < 32 || elementRange > windowRange * 1.15) ? scroller : null;
       const scrollRange = activeScroller ? elementRange : windowRange;
       const captureStepHeight = activeScroller ? activeScroller.clientHeight : viewportHeight;
+      // Capture small, frequent steps. Virtualized tables often render rows
+      // only as they enter the viewport; large jumps can skip rows entirely.
+      // Each screenshot contributes only the next uncovered page strip, so a
+      // later capture cannot overwrite already stitched data with a blank row.
+      const captureStepStride = Math.max(80, Math.min(180, Math.floor(captureStepHeight * 0.16)));
       const width = activeScroller ? viewportWidth : pageWidth;
       const height = activeScroller ? viewportHeight + scrollRange : pageHeight;
       scrollerOriginal = activeScroller ? {
@@ -100,7 +105,7 @@
       }
 
       const steps = [];
-      for (let y = 0; y <= scrollRange; y += captureStepHeight) steps.push(Math.min(y, scrollRange));
+      for (let y = 0; y < scrollRange; y += captureStepStride) steps.push(y);
       if (!steps.length || steps.at(-1) !== scrollRange) steps.push(scrollRange);
       const uniqueSteps = [...new Set(steps)];
       const scrollDescription = activeScroller ? "內部捲動區" : "整個頁面";
@@ -136,7 +141,7 @@
         }
         return true;
       });
-      const persistentSidePanelRegions = persistentSidePanelRoots.map((el) => {
+      persistentSidePanelRegions = persistentSidePanelRoots.map((el) => {
         const rect = el.getBoundingClientRect();
         let backgroundColor = "#ffffff";
         for (let node = el; node && node !== body; node = node.parentElement) {
@@ -170,7 +175,9 @@
           originalScrollBehavior: panelScroller?.style.scrollBehavior || ""
         };
       }).filter((panel) => panel.right > panel.left);
-      const isInsidePersistentSidePanel = (el) => persistentSidePanelRoots.some((rootEl) => rootEl === el || rootEl.contains(el));
+      const isRelatedToPersistentSidePanel = (el) => persistentSidePanelRoots.some((rootEl) =>
+        rootEl === el || rootEl.contains(el) || el.contains(rootEl)
+      );
       canvas = document.createElement("canvas");
       canvas.width = outputWidth;
       canvas.height = outputHeight;
@@ -210,68 +217,26 @@
         }
         await sleep(100);
       };
-      const canHide = (el) => (!activeScroller || (el !== activeScroller && !el.contains(activeScroller))) &&
-        !isInsidePersistentSidePanel(el);
+      // Protect the panel and its ancestor chain. Some SPA frameworks put a
+      // fixed sidebar inside a fixed application shell; hiding that shell also
+      // removes every navigation label even though the sidebar itself was
+      // correctly classified and excluded from the page crop.
       for (const panel of persistentSidePanelRegions) {
         if (!panel.scroller) continue;
         panel.scroller.style.scrollBehavior = "auto";
         panel.scroller.scrollTop = 0;
       }
 
+      let outputCoveredCss = 0;
       for (let i = 0; i < uniqueSteps.length; i++) {
         const y = uniqueSteps[i];
         sendProgress(jobId, { done: i, total: uniqueSteps.length, message: `擷取第 ${i + 1} / ${uniqueSteps.length} 段…` },
           `正在擷取完整網頁（${imageOptions.label}）…`);
         await scrollToAndWait(y);
-        if (i > 0) {
-          const nodes = [...document.querySelectorAll("body *")];
-          const candidates = new Set();
-          for (const el of nodes) {
-            const rect = el.getBoundingClientRect();
-            if (!isVisible(el, rect)) continue;
-            const pos = getComputedStyle(el).position;
-            if (canHide(el) && (pos === "fixed" || pos === "sticky") && !isPersistentSidePanel(el, rect)) candidates.add(el);
-          }
-          const maxScrollY = activeScroller
-            ? Math.max(0, activeScroller.scrollHeight - activeScroller.clientHeight)
-            : Math.max(root.scrollHeight, body.scrollHeight || 0, root.clientHeight) - viewportHeight;
-          const baseY = getScrollY();
-          const probeY = baseY + 64 <= maxScrollY ? baseY + 64 : Math.max(0, baseY - 64);
-          if (Math.abs(probeY - baseY) >= 32) {
-            const before = new Map();
-            for (const el of nodes) {
-              const rect = el.getBoundingClientRect();
-              if (isVisible(el, rect)) before.set(el, { top: rect.top, left: rect.left });
-            }
-            setScrollY(probeY);
-            await sleep(120);
-            if (Math.abs(getScrollY() - baseY) >= 16) {
-              for (const [el, firstRect] of before) {
-                if (!el.isConnected) continue;
-                const rect = el.getBoundingClientRect();
-                if (isVisible(el, rect) && canHide(el) && !isPersistentSidePanel(el, rect) && Math.abs(rect.top - firstRect.top) <= 3 && Math.abs(rect.left - firstRect.left) <= 3) candidates.add(el);
-              }
-            }
-            setScrollY(y);
-            await sleep(180);
-          }
-          for (const el of document.querySelectorAll("body *")) {
-            const rect = el.getBoundingClientRect();
-            if (isVisible(el, rect) && canHide(el) && ["fixed", "sticky"].includes(getComputedStyle(el).position) && !isPersistentSidePanel(el, rect)) candidates.add(el);
-          }
-          const outermost = [...candidates].filter((el) => {
-            for (let parent = el.parentElement; parent && parent !== body; parent = parent.parentElement) {
-              if (candidates.has(parent)) return false;
-            }
-            return true;
-          });
-          for (const el of outermost) {
-            if (!el.isConnected || hidden.some((item) => item[0] === el)) continue;
-            hidden.push([el, el.style.getPropertyValue("visibility"), el.style.getPropertyPriority("visibility")]);
-            el.style.setProperty("visibility", "hidden", "important");
-          }
-          await sleep(120);
-        }
+        // Never hide page elements while capturing. Position-based filtering
+        // can classify virtualized table rows or charts as floating chrome,
+        // which permanently removes real content from the exported image.
+        // Repeated fixed UI is preferable to missing page data.
 
         await sleep(550);
         const captureOptions = { format: imageOptions.captureFormat };
@@ -284,26 +249,46 @@
         });
         if (!captured?.ok || !captured.dataUrl) throw new Error(captured?.message || "瀏覽器沒有回傳截圖片段。");
         const image = await loadImage(captured.dataUrl);
-        const sourceCssHeight = image.height / dpr;
-        const drawCssHeight = Math.min(sourceCssHeight, height - y);
-        const sourcePixelHeight = Math.round(drawCssHeight * dpr);
-        const destinationY = Math.round(y * dpr);
+        const sourceScaleY = image.height / Math.max(1, viewportHeight);
+        const sourceTopCss = i === 0 ? 0 : outputCoveredCss - y;
+        if (sourceTopCss < -2 || sourceTopCss >= viewportHeight) {
+          image.close?.();
+          throw new Error(`拼接位置不連續（第 ${i + 1} 段），已停止以免輸出缺列。`);
+        }
+        const firstTileLimit = i === 0
+          ? (uniqueSteps.length === 1 ? height : Math.max(1, captureStepHeight - captureStepStride))
+          : viewportHeight - sourceTopCss;
+        const drawCssHeight = Math.min(firstTileLimit, viewportHeight - sourceTopCss, height - outputCoveredCss);
+        if (drawCssHeight <= 0) { image.close?.(); break; }
+        const sourcePixelTop = Math.round(Math.max(0, sourceTopCss) * sourceScaleY);
+        const sourcePixelHeight = Math.min(image.height - sourcePixelTop, Math.round(drawCssHeight * sourceScaleY));
+        const destinationY = Math.round(outputCoveredCss * dpr);
+        const destinationPixelHeight = Math.round(drawCssHeight * dpr);
+        if (sourcePixelHeight <= 0 || destinationPixelHeight <= 0) {
+          image.close?.();
+          throw new Error(`第 ${i + 1} 段截圖高度無效，已停止以免下載不完整長圖。`);
+        }
         if (persistentSidePanelRegions.length === 0) {
-          ctx.drawImage(image, 0, 0, image.width, sourcePixelHeight, 0, destinationY, outputWidth, sourcePixelHeight);
+          ctx.drawImage(image, 0, sourcePixelTop, image.width, sourcePixelHeight, 0, destinationY, outputWidth, destinationPixelHeight);
         } else {
           // Keep fixed panels out of page segments. They are captured and
           // stitched in a separate pass below using their own scroll range.
           ctx.save();
           ctx.beginPath();
-          ctx.rect(0, destinationY, outputWidth, sourcePixelHeight);
+          ctx.rect(0, destinationY, outputWidth, destinationPixelHeight);
           for (const panel of persistentSidePanelRegions) {
-            ctx.rect(panel.left * outputScaleX, destinationY, (panel.right - panel.left) * outputScaleX, sourcePixelHeight);
+            ctx.rect(panel.left * outputScaleX, destinationY, (panel.right - panel.left) * outputScaleX, destinationPixelHeight);
           }
           ctx.clip("evenodd");
-          ctx.drawImage(image, 0, 0, image.width, sourcePixelHeight, 0, destinationY, outputWidth, sourcePixelHeight);
+          ctx.drawImage(image, 0, sourcePixelTop, image.width, sourcePixelHeight, 0, destinationY, outputWidth, destinationPixelHeight);
           ctx.restore();
         }
+        outputCoveredCss += drawCssHeight;
         image.close?.();
+      }
+
+      if (outputCoveredCss < height - 2) {
+        throw new Error(`長圖只拼接到 ${Math.round(outputCoveredCss)} / ${Math.round(height)} px；已取消下載，請重試。`);
       }
 
       if (persistentSidePanelRegions.length) {
@@ -358,11 +343,6 @@
       sendProgress(jobId, { done: uniqueSteps.length, total: uniqueSteps.length, message: "下載完成" },
         `完整網頁 ${imageOptions.label} 已自動下載，共拼接 ${uniqueSteps.length} 段。`, "ok");
     } finally {
-      for (const [el, value, priority] of hidden) {
-        if (!el?.style) continue;
-        if (value) el.style.setProperty("visibility", value, priority || "");
-        else el.style.removeProperty("visibility");
-      }
       for (const panel of persistentSidePanelRegions) {
         if (!panel.scroller) continue;
         panel.scroller.style.scrollBehavior = panel.originalScrollBehavior;
