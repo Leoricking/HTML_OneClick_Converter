@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "HTML 一鍵轉換器／網頁剪藏",
-  "version": "2.3.4",
+  "version": "2.3.9",
   "description": "互動預覽並將網頁儲存為文章、MHTML、書籤、圖片、PDF、純文字，或傳送至 OneNote。",
   "minimum_chrome_version": "109",
   "permissions": [

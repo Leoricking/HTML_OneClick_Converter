@@ -1,5 +1,16 @@
 Validation report
 =================
+- v2.3.9 detects programmatically scrollable overflow:hidden containers used by SPA pages
+- v2.3.9 verifies each target scroll position and aborts rather than silently capturing the same viewport repeatedly
+- v2.3.9 reports detected scroll mode, scroll range, and segment count
+- v2.3.8 full-page capture visibly smooth-scrolls each viewport and waits for the target position to settle before capture
+- v2.3.7 sends the final stitched image to the downloads worker in bounded 512 KiB chunks
+- v2.3.7 validates download state and reports transfer/download failures instead of claiming success
+- v2.3.6 full-page capture runs in a tab content script and continues after the popup closes
+- v2.3.6 background service worker captures segments and starts the automatic image download
+- v2.3.6 refuses to capture another active tab and reports the foreground-tab requirement
+- v2.3.5 screenshot and download APIs handle Chromium callback and Promise forms with explicit timeout/error feedback
+- v2.3.5 callback-style captureVisibleTab is covered by smoke test
 - v2.3.1 simplified reader selection actions only copy/save highlighted content
 - v2.3.0 simplified reader adds an independent whole-article clipping action
 - v2.2.0 element picker locks the selection before save
