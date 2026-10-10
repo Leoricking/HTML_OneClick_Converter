@@ -5,6 +5,7 @@ const fullPageDebuggerSessions = new Map();
 const visibleCaptureQueues = new Map();
 const visibleCaptureStartedAt = new Map();
 const VISIBLE_CAPTURE_MIN_INTERVAL_MS = 600;
+let captureDiagnosticWriteQueue = Promise.resolve();
 
 function debuggerCommand(target, method, params = {}) {
   return chrome.debugger.sendCommand(target, method, params);
@@ -15,7 +16,23 @@ async function beginFullPageDebuggerSession(tabId, windowId, jobId) {
   if (fullPageDebuggerSessions.has(jobId)) return { ok: true };
   const target = { tabId };
   let attached = false;
+  let originalZoom = null;
+  let zoomAdjusted = false;
   try {
+    // Low browser zoom rasterizes small text at very few physical pixels.
+    // Temporarily capture at 100%, then restore the user's exact zoom.
+    try {
+      originalZoom = await chrome.tabs.getZoom(tabId);
+      if (Number.isFinite(originalZoom) && originalZoom > 0 && originalZoom < 0.99) {
+        await chrome.tabs.setZoom(tabId, 1);
+        zoomAdjusted = true;
+        await new Promise((resolve) => setTimeout(resolve, 450));
+      }
+    } catch (zoomError) {
+      originalZoom = null;
+      zoomAdjusted = false;
+      console.warn("Could not normalize page zoom for capture:", zoomError);
+    }
     await chrome.debugger.attach(target, "1.3");
     attached = true;
     await debuggerCommand(target, "Page.enable");
@@ -28,11 +45,11 @@ async function beginFullPageDebuggerSession(tabId, windowId, jobId) {
     // for the source tab to become active instead of accidentally capturing a
     // different tab or cancelling the whole job.
     const reason = error?.message || String(error);
-    fullPageDebuggerSessions.set(jobId, { tabId, windowId, target, mode: "visible", fallbackReason: reason });
-    return { ok: true, mode: "visible", warning: reason };
+    fullPageDebuggerSessions.set(jobId, { tabId, windowId, target, mode: "visible", fallbackReason: reason, originalZoom, zoomAdjusted });
+    return { ok: true, mode: "visible", warning: reason, originalZoom, zoomAdjusted };
   }
-  fullPageDebuggerSessions.set(jobId, { tabId, windowId, target, mode: "debugger" });
-  return { ok: true, mode: "debugger" };
+  fullPageDebuggerSessions.set(jobId, { tabId, windowId, target, mode: "debugger", originalZoom, zoomAdjusted });
+  return { ok: true, mode: "debugger", originalZoom, zoomAdjusted };
 }
 
 async function endFullPageDebuggerSession(jobId, tabId) {
@@ -41,6 +58,14 @@ async function endFullPageDebuggerSession(jobId, tabId) {
   fullPageDebuggerSessions.delete(jobId);
   try { if (session.mode === "debugger") await chrome.debugger.detach(session.target); } catch (error) {
     console.warn("Could not detach screenshot debugger session:", error);
+  }
+  if (session.zoomAdjusted && Number.isFinite(session.originalZoom)) {
+    try {
+      await chrome.tabs.setZoom(session.tabId, session.originalZoom);
+      await new Promise((resolve) => setTimeout(resolve, 180));
+    } catch (error) {
+      console.warn("Could not restore the original page zoom after capture:", error);
+    }
   }
   return { ok: true };
 }
@@ -71,6 +96,20 @@ async function captureTabViewport(tabId, options, jobId) {
   const result = await debuggerCommand(session.target, "Page.captureScreenshot", params);
   if (typeof result?.data !== "string" || !result.data) throw new Error("瀏覽器沒有回傳來源分頁截圖資料。");
   return { dataUrl: `data:image/${format};base64,${result.data}`, mode: "debugger" };
+}
+
+async function dispatchCaptureWheel(jobId, tabId, x, y, deltaY) {
+  const session = fullPageDebuggerSessions.get(jobId);
+  if (!session || session.tabId !== tabId) throw new Error("來源分頁的截圖工作已中斷，無法執行滾輪捲動。");
+  if (session.mode !== "debugger") return { ok: false, mode: "visible" };
+  await debuggerCommand(session.target, "Input.dispatchMouseEvent", {
+    type: "mouseWheel",
+    x: Math.max(0, Number(x) || 0),
+    y: Math.max(0, Number(y) || 0),
+    deltaX: 0,
+    deltaY: Math.max(-1200, Math.min(1200, Number(deltaY) || 0))
+  });
+  return { ok: true, mode: "debugger" };
 }
 
 function safeFilename(value, fallback = "webpage") {
@@ -253,15 +292,35 @@ async function saveSelectedRegion(message, sender) {
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (!message) return false;
   if (message.type === "full-page-capture-progress") {
-    chrome.runtime.sendMessage({
-      type: "full-capture-progress-update",
-      progress: message.progress,
-      status: message.status,
-      statusType: message.statusType
-    }).catch(() => {});
-    return false;
+    captureDiagnosticWriteQueue = captureDiagnosticWriteQueue.then(async () => {
+    if (message.diagnostic) {
+      const stored = await chrome.storage.local.get({ fullPageCaptureLog: { jobId: "", entries: [] } });
+        const current = stored.fullPageCaptureLog || { jobId: "", entries: [] };
+        const entries = current.jobId === message.jobId ? current.entries : [];
+        entries.push(message.diagnostic);
+        if (entries.length > 500) entries.splice(0, entries.length - 500);
+        await chrome.storage.local.set({ fullPageCaptureLog: { jobId: message.jobId, updatedAt: new Date().toISOString(), entries } });
+      }
+      chrome.runtime.sendMessage({
+        type: "full-capture-progress-update",
+        progress: message.progress,
+        status: message.status,
+        statusType: message.statusType,
+        diagnostic: message.diagnostic
+      }).catch(() => {});
+    }).then(() => sendResponse?.({ ok: true })).catch((error) => {
+      console.warn("無法保存完整頁面診斷記錄：", error);
+      sendResponse?.({ ok: false, message: error?.message || String(error) });
+    });
+    return true;
   }
-  if (!["clip-selected-html", "clip-selected-region", "begin-full-page-capture-session", "end-full-page-capture-session", "capture-full-page-segment",
+  if (message.type === "get-full-page-capture-log") {
+    captureDiagnosticWriteQueue.then(() => chrome.storage.local.get({ fullPageCaptureLog: null })).then(({ fullPageCaptureLog }) => {
+      sendResponse({ ok: true, log: fullPageCaptureLog || null });
+    }).catch((error) => sendResponse({ ok: false, message: error?.message || String(error) }));
+    return true;
+  }
+  if (!["clip-selected-html", "clip-selected-region", "begin-full-page-capture-session", "end-full-page-capture-session", "capture-full-page-segment", "scroll-capture-by-wheel",
     "begin-full-page-download", "append-full-page-download", "finish-full-page-download", "abort-full-page-download"].includes(message.type)) return false;
   (async () => {
     if (message.type === "clip-selected-html") return saveSelectedHtml(message);
@@ -278,6 +337,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       if (!sender.tab?.id || !Number.isInteger(sender.tab.windowId)) throw new Error("找不到完整頁面截圖的來源分頁。");
       const captured = await captureTabViewport(sender.tab.id, message.options || { format: "png" }, message.jobId);
       return { ok: true, ...captured };
+    }
+    if (message.type === "scroll-capture-by-wheel") {
+      if (!sender.tab?.id) throw new Error("找不到完整頁面截圖的來源分頁。");
+      return dispatchCaptureWheel(message.jobId, sender.tab.id, message.x, message.y, message.deltaY);
     }
     if (message.type === "begin-full-page-download") {
       if (!sender.tab?.id || !message.jobId || typeof message.filename !== "string") throw new Error("長圖下載工作資訊不完整。");

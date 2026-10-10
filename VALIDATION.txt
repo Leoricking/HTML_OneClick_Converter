@@ -1,5 +1,43 @@
+- v2.5.18 verifies window scrolling first and tests inner scroll containers when the window does not move; no height-ratio guess is used
+- v2.5.18 regression tests cover moving window, blocked window, moving inner container, and stuck wrapper
+- v2.5.17 sends a bounded CDP wheel event only when direct scrolling stalls, then rechecks actual document/container movement
+- v2.5.17 integration test verifies wheel input targets the source tab with the requested delta
+- v2.5.16 regression test selects only scroll containers that demonstrate real movement and restores the probe position
+- v2.5.16 checks alternative nested candidates and document.scrollingElement before capture
 Validation report
 =================
+- v2.5.35 low zoom temporarily normalizes to 100% and restores original zoom on success/error
+- v2.5.35 regression test verifies original zoom restore and capture diagnostic
+- v2.5.35 full-page tiles are captured as lossless PNG; final JPG is encoded once at quality 96
+- v2.5.35 regression test rejects per-tile JPEG compression before stitching
+- v2.5.35 regression test verifies the ChatGPT left rail is included once and output width preserves the original conversation scale
+- v2.5.35 composer detection covers form and nested DIV containers; lower-center floating controls are filtered during capture
+- v2.5.35 diagnostics record the left-rail preservation and exact filtered-control rectangles
+- v2.5.32 ChatGPT long captures use the measured conversation scroller rectangle, excluding repeated sidebar and viewport chrome
+- v2.5.32 hides the ChatGPT composer/floating controls during capture and restores their exact inline visibility afterward
+- v2.5.32 diagnostics record the content crop and filtered control identifiers without recording page text or screenshot pixels
+- v2.5.31 regression tests verify negative ChatGPT scrollTop maps logical capture top to physical -range and advances toward zero
+- v2.5.31 normal positive scrollTop mapping remains unchanged
+- v2.5.30 persists capture diagnostics after the popup closes and provides one-click copy in the capture feedback area
+- v2.5.30 records live scroller inventory, selected node, each wheel fallback, settled segment position, stitched coverage, download, and error stack
+- v2.5.30 diagnostics omit page text and screenshot pixels
+- v2.5.29 full-DOM wheel preflight discovers the ChatGPT scroller even when it fails initial size/overflow candidate filters
+- v2.5.29 regression test verifies omitted scroller discovery and restoration of its original scroll position
+- v2.5.29 records the live DOM scroller inventory in visible preflight diagnostics
+- v2.5.28 retries the preflight-verified ChatGPT wheel point up to six times and stitches from measured scroll position
+- v2.5.28 regression test accepts the reported 125 px target / 107 px movement but rejects a 0 px stall
+- v2.5.28 failure diagnostics include tracked element id/class, DOM connection state, and wheel retry count
+- v2.5.27 wheel preflight ignores unmeasured DOM nodes' pre-existing scrollTop and never resets their position
+- v2.5.27 regression test covers a long-page scroller already at a nonzero position
+- v2.5.26 full-page scroll retries reuse the exact hit-test point proven to move the main content during preflight
+- v2.5.25 recomputes pageHeight and windowRange after trusted-wheel discovery selects window scrolling; prevents viewport-sized output
+- v2.5.25 regression test verifies fresh document dimensions are used for long-image canvas sizing
+- v2.5.24 exposes wheel dispatch, hit-test target, actual moved node/delta, and candidate count in the visible failure status
+- v2.5.24 aborts before stitching when trusted-wheel preflight cannot verify actual movement
+- v2.5.23 validates selected ChatGPT scroll owner with trusted browser wheel movement before measuring or stitching; writable scrollTop alone cannot qualify
+- v2.5.23 wheel probe rescans live DOM after SPA node replacement and restores the detected scroller
+- v2.5.22 stalled-scroll recovery rescans live DOM nodes and detects a replaced/previously omitted scroll owner after trusted wheel input
+- v2.5.22 scroll failure reports selected element, current scroll range, and background capture mode
 - v2.5.15 regression test serializes concurrent captureVisibleTab fallback requests at >=550 ms intervals
 - v2.5.15 retries Chromium MAX_CAPTURE_VISIBLE_TAB_CALLS_PER_SECOND errors with longer backoff
 - v2.5.14 regression test reproduces the reported 4099 px max / 4068 px actual / 4800 px covered / 732 px viewport and skips only the empty final overlap
@@ -106,3 +144,9 @@ Validation report
 - background.js syntax checked
 - Existing image, PDF, TXT, clipboard, OneNote and full-page functions preserved
 - New permissions are limited to pageCapture, clipboardWrite and identity for user-triggered actions
+- v2.5.19 regression test evaluates the exact elementRange expression for inner-scroller and window-scroll paths; rejects the undefined `scroller` identifier
+- v2.5.19 fixes full-page capture analysis failure `scroller is not defined` by using the measured activeScroller
+- v2.5.20 regression test discovers a scroll container via a bounded wheel probe when programmatic scrollTop does not move it, including a page-tail starting point, and verifies restoration
+- v2.5.20 prevents a viewport-only download when a scrollable main-content hit-test path cannot be verified
+- v2.5.21 tests wheel-based source discovery when the measured page is long but overflow-style candidate discovery is empty
+- v2.5.21 rejects viewport-only output when a long document's scroll movement cannot be verified

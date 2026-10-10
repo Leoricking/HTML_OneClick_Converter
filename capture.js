@@ -36,6 +36,42 @@ function getPageCaptureTarget(frontierTarget, liveMaxY, isLastSegment) {
   return isLastSegment ? liveMaxY : Math.min(frontierTarget, liveMaxY);
 }
 
+function getCaptureDocumentHeight(root, body) {
+  return Math.max(root.scrollHeight, body?.scrollHeight || 0, root.clientHeight);
+}
+
+function isReverseCaptureScroller(element, styleReader = globalThis.getComputedStyle) {
+  if (!element) return false;
+  return element.scrollTop < -3 || (typeof styleReader === "function" && styleReader(element).flexDirection === "column-reverse");
+}
+
+function getCaptureLogicalScrollY(element, isReversed, maxY) {
+  return isReversed ? element.scrollTop + maxY : element.scrollTop;
+}
+
+function getCapturePhysicalScrollY(logicalY, maxY, isReversed) {
+  return isReversed ? logicalY - maxY : logicalY;
+}
+
+function mapCaptureRectToPixels(rect, imageWidth, imageHeight, viewportWidth, viewportHeight) {
+  const scaleX = imageWidth / Math.max(1, viewportWidth);
+  const scaleY = imageHeight / Math.max(1, viewportHeight);
+  return {
+    x: Math.round(rect.left * scaleX),
+    y: Math.round(rect.top * scaleY),
+    width: Math.max(1, Math.round(rect.width * scaleX)),
+    height: Math.max(1, Math.round(rect.height * scaleY)),
+    scaleX,
+    scaleY
+  };
+}
+
+function getChatGPTCaptureLayout(contentRect) {
+  const sidebarWidth = Math.max(0, contentRect.left);
+  const contentWidth = Math.max(1, contentRect.width);
+  return { sidebarWidth, contentWidth, outputWidth: sidebarWidth + contentWidth };
+}
+
 function canTrimCaptureTail(preflightHeight, liveHeight, coveredHeight, scrollY, liveMaxY, bottomClampPx = 0) {
   const atLiveBottom = scrollY >= liveMaxY - 3 ||
     (bottomClampPx > 0 && bottomClampPx <= 64 && scrollY >= liveMaxY - bottomClampPx - 3);
@@ -48,18 +84,159 @@ function isCoveredClampedTail(sourceTopCss, viewportHeight, coveredHeight, actua
     actualY >= liveMaxY - 64 && Math.abs(coveredHeight - (actualY + viewportHeight)) <= 2;
 }
 
+async function probeCaptureScrollContainer(element, waitFrame = () => new Promise((resolve) => requestAnimationFrame(resolve))) {
+  const max = Math.max(0, element.scrollHeight - element.clientHeight);
+  const before = element.scrollTop;
+  const probe = before + 64 <= max ? before + 64 : Math.max(0, before - 64);
+  if (Math.abs(probe - before) <= 3) return false;
+  const oldBehavior = element.style.scrollBehavior;
+  try {
+    element.style.scrollBehavior = "auto";
+    element.scrollTop = probe;
+    await waitFrame();
+    await waitFrame();
+    const moved = Math.abs(element.scrollTop - before) > 3;
+    element.scrollTop = before;
+    await waitFrame();
+    return moved;
+  } finally {
+    element.style.scrollBehavior = oldBehavior;
+  }
+}
+
+async function probeCaptureWindowScroll(windowObject, maxY, waitFrame = () => new Promise((resolve) => requestAnimationFrame(resolve))) {
+  const before = windowObject.scrollY;
+  const target = before + 64 <= maxY ? before + 64 : Math.max(0, before - 64);
+  if (Math.abs(target - before) <= 3) return false;
+  windowObject.scrollTo(0, target);
+  await waitFrame();
+  await waitFrame();
+  const moved = Math.abs(windowObject.scrollY - before) > 3;
+  windowObject.scrollTo(0, before);
+  await waitFrame();
+  return moved;
+}
+
+async function selectCaptureScrollContainer(windowObject, windowRange, candidates, documentScroller, body,
+  waitFrame = () => new Promise((resolve) => requestAnimationFrame(resolve))) {
+  if (await probeCaptureWindowScroll(windowObject, windowRange, waitFrame)) return null;
+  for (const candidate of candidates.slice(0, 24)) {
+    if (await probeCaptureScrollContainer(candidate.element, waitFrame)) return candidate.element;
+  }
+  if (documentScroller && documentScroller !== body && await probeCaptureScrollContainer(documentScroller, waitFrame)) {
+    return documentScroller;
+  }
+  return null;
+}
+
+async function probeCaptureWheelScrollContainer(windowObject, candidates, documentScroller, dispatchWheel,
+  waitFrame = () => new Promise((resolve) => requestAnimationFrame(resolve)), documentObject = null) {
+  const elements = [...new Set([
+    ...candidates.map((candidate) => candidate.element || candidate),
+    documentScroller,
+    ...(documentObject ? collectLiveCaptureScrollers(documentObject) : [])
+  ].filter(Boolean))];
+  const beforeWindowY = windowObject.scrollY;
+  const before = new Map(elements.map((element) => [element, element.scrollTop]));
+  const scrollable = elements.filter((element) => element.scrollHeight - element.clientHeight > 32);
+  if (!scrollable.length) return { attempted: false, dispatched: false, scroller: null, windowMoved: false, moved: false, movement: "沒有找到有捲動範圍的 DOM 元素" };
+
+  // The first entries are the ancestors under a point in the main content
+  // area, followed by other measured candidates. If the conversation is
+  // already at its tail, probe upward so a wheel test can still identify it.
+  const primary = candidates[0]?.element || candidates[0] || scrollable[0];
+  const primaryMax = Math.max(0, primary.scrollHeight - primary.clientHeight);
+  const reversed = isReverseCaptureScroller(primary);
+  const atBottom = reversed ? primary.scrollTop >= -3 : primary.scrollTop >= primaryMax - 3;
+  const direction = atBottom ? -1 : 1;
+  const deltaY = direction * 160;
+  let dispatched = false;
+  let movedScroller = null;
+  try {
+    dispatched = Boolean(await dispatchWheel(deltaY));
+    if (!dispatched) return { attempted: true, dispatched: false, scroller: null, windowMoved: false, moved: false, movement: "背景未送出滾輪事件" };
+    await waitFrame();
+    await waitFrame();
+    movedScroller = documentObject
+      ? findMovedCaptureScroller(documentObject, before, direction)
+      : elements.map((element) => ({ element, delta: element.scrollTop - before.get(element) }))
+        .filter((item) => item.delta * direction > 3)
+        .sort((a, b) => Math.abs(b.delta) - Math.abs(a.delta))[0] || null;
+    const moved = movedScroller ? [movedScroller] : [];
+    const windowMoved = Math.abs(windowObject.scrollY - beforeWindowY) > 3;
+    const scroller = windowMoved ? null : (moved[0]?.element || null);
+    const movement = windowMoved ? `window ${Math.round(windowObject.scrollY - beforeWindowY)}px`
+      : movedScroller ? `${movedScroller.element.tagName?.toLowerCase?.() || "element"}${movedScroller.element.id ? `#${movedScroller.element.id}` : ""} ${Math.round(movedScroller.delta)}px`
+      : "無 DOM 位移";
+    return { attempted: true, dispatched: true, scroller, windowMoved, moved: Boolean(scroller || windowMoved), movement };
+  } finally {
+    for (const element of elements) {
+      const originalY = before.get(element);
+      if (Math.abs(element.scrollTop - originalY) > 3) element.scrollTop = originalY;
+    }
+    if (movedScroller && !elements.includes(movedScroller.element) && before.has(movedScroller.element)) {
+      movedScroller.element.scrollTop = before.get(movedScroller.element);
+    }
+    if (Math.abs(windowObject.scrollY - beforeWindowY) > 3) windowObject.scrollTo(0, beforeWindowY);
+    if (dispatched) {
+      await waitFrame();
+      await waitFrame();
+    }
+  }
+}
+
+// On virtualized SPA pages, the real scroll owner may be a nested element
+// which was not among the initial size/visibility candidates. Only run this
+// more expensive full DOM scan after a direct scroll has stalled.
+function collectLiveCaptureScrollers(documentObject) {
+  const result = [];
+  const seen = new Set();
+  const add = (element) => {
+    if (!element || seen.has(element)) return;
+    seen.add(element);
+    if (element.scrollHeight - element.clientHeight > 32) result.push(element);
+  };
+  add(documentObject.scrollingElement);
+  add(documentObject.documentElement);
+  add(documentObject.body);
+  for (const element of documentObject.querySelectorAll("body *")) add(element);
+  return result;
+}
+
+function findMovedCaptureScroller(documentObject, beforePositions, direction = 1) {
+  return collectLiveCaptureScrollers(documentObject)
+    // Only compare nodes that were actually measured before dispatching the
+    // wheel event. Treating an untracked node's existing scrollTop as a delta
+    // from zero can mistake a scroller already at the bottom for one moved by
+    // this wheel event (common on long SPA conversations).
+    .filter((element) => beforePositions.has(element))
+    .map((element) => ({ element, delta: element.scrollTop - beforePositions.get(element) }))
+    .filter((item) => item.delta * direction > 3)
+    .sort((a, b) => Math.abs(b.delta) - Math.abs(a.delta))[0] || null;
+}
+
 (() => {
   if (globalThis.__htmlConverterCaptureListener) return;
   globalThis.__htmlConverterCaptureListener = true;
 
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-  const sendProgress = (jobId, progress, status, statusType = "") => {
+  const sendProgress = (jobId, progress, status, statusType = "", details = null) => {
+    const entry = {
+      time: new Date().toISOString(),
+      progress: progress?.message || "",
+      status: status || "",
+      details: details || undefined
+    };
+    const log = globalThis.__htmlConverterCurrentDiagnostics || (globalThis.__htmlConverterCurrentDiagnostics = []);
+    log.push(entry);
+    if (log.length > 500) log.splice(0, log.length - 500);
     chrome.runtime.sendMessage({
       type: "full-page-capture-progress",
       jobId,
       progress,
       status,
-      statusType
+      statusType,
+      diagnostic: entry
     }).catch(() => {});
   };
 
@@ -74,7 +251,9 @@ function isCoveredClampedTail(sourceTopCss, viewportHeight, coveredHeight, actua
     runFullPageCapture(message)
       .catch((error) => {
         const reason = error?.message || String(error);
-        sendProgress(message.jobId, null, `完整頁面截圖失敗：${reason}`, "error");
+        sendProgress(message.jobId, null, `完整頁面截圖失敗：${reason}`, "error", {
+          event: "capture-error", message: reason, stack: error?.stack || ""
+        });
       })
       .finally(() => { globalThis.__htmlConverterCaptureRunning = false; });
     return false;
@@ -82,6 +261,10 @@ function isCoveredClampedTail(sourceTopCss, viewportHeight, coveredHeight, actua
 
   async function runFullPageCapture(job) {
     const { jobId, windowId, title, imageOptions } = job;
+    // Keep every scroll tile lossless. Encoding each tile as JPG and then
+    // encoding the stitched canvas as JPG caused double compression blur.
+    const segmentCaptureOptions = { format: "png" };
+    globalThis.__htmlConverterCurrentDiagnostics = [];
     const root = document.documentElement;
     const body = document.body;
     if (!root || !body) throw new Error("網頁內容尚未載入完成。");
@@ -93,37 +276,47 @@ function isCoveredClampedTail(sourceTopCss, viewportHeight, coveredHeight, actua
       overflow: root.style.overflow
     };
     let activeScroller = null;
+    let activeScrollerIsReversed = false;
     let scrollerOriginal = null;
     let canvases = [];
     let persistentSidePanelRegions = [];
+    let chatGPTHiddenUi = [];
     let debuggerSessionStarted = false;
+    let zoomAdjustedForCapture = false;
     let bottomClampPx = 0;
+    let scrollProbeDiagnostics = "尚未執行滾輪驗證";
+    let captureScrollInputPoint = null;
     try {
       const debuggerStart = await chrome.runtime.sendMessage({ type: "begin-full-page-capture-session", jobId });
       if (!debuggerStart?.ok) throw new Error(debuggerStart?.message || "無法啟用來源分頁背景截圖。");
       debuggerSessionStarted = true;
+      zoomAdjustedForCapture = debuggerStart.zoomAdjusted === true;
       const backgroundMode = debuggerStart.mode || "debugger";
+      const zoomNotice = debuggerStart.zoomAdjusted
+        ? "為提高小字清晰度，已暫時使用 100% 瀏覽器縮放；完成後會恢復原縮放。"
+        : "";
       const modeNotice = backgroundMode === "visible"
-        ? "瀏覽器不允許背景連接此分頁；截圖會暫停等待原網頁，切回後自動續跑。"
-        : `正在準備完整網頁截圖（${imageOptions.label}）…`;
+        ? `瀏覽器不允許背景連接此分頁；截圖會暫停等待原網頁，切回後自動續跑。${zoomNotice}`
+        : `${zoomNotice || `正在準備完整網頁截圖（${imageOptions.label}）…`}`;
       sendProgress(jobId, { done: 0, total: 1, message: "分析頁面尺寸…" }, modeNotice, backgroundMode === "visible" ? "warning" : "");
+      sendProgress(jobId, null, "", "", { event: "capture-zoom", originalZoom: debuggerStart.originalZoom,
+        normalizedTo100: debuggerStart.zoomAdjusted === true, effectiveZoom: debuggerStart.zoomAdjusted ? 1 : debuggerStart.originalZoom });
       root.style.scrollBehavior = "auto";
       const viewportWidth = window.innerWidth;
       const viewportHeight = window.innerHeight;
       const pageWidth = Math.max(root.scrollWidth, body.scrollWidth || 0, root.clientWidth);
-      const pageHeight = Math.max(root.scrollHeight, body.scrollHeight || 0, root.clientHeight);
-      const windowRange = Math.max(0, pageHeight - viewportHeight);
+      let pageHeight = getCaptureDocumentHeight(root, body);
+      let windowRange = Math.max(0, pageHeight - viewportHeight);
 
-      // Detect the main nested scroller used by SPA pages and dashboards.
-      let scroller = null;
-      let bestScore = 0;
+      // Detect likely nested scrollers, then probe their actual scrollTop
+      // behavior. ChatGPT and other SPAs can expose a large scrollHeight on a
+      // wrapper that is not the element that owns user scrolling.
+      const scrollCandidates = [];
       for (const el of document.querySelectorAll("body *")) {
         const style = getComputedStyle(el);
-        // Some SPA dashboards keep the page visually clipped with
-        // overflow:hidden and move the content by setting scrollTop from JS.
-        // Such containers are still programmatically scrollable, so include
-        // them and verify the actual scroll position before every capture.
-        if (!/(auto|scroll|overlay|hidden)/.test(style.overflowY)) continue;
+        // Do not rely on overflowY alone. ChatGPT and other SPAs can route
+        // wheel events through a clipped/transformed shell whose computed
+        // overflow value does not advertise it as the scroll owner.
         const range = el.scrollHeight - el.clientHeight;
         if (range < 32 || el.clientHeight < viewportHeight * 0.3 || el.clientWidth < viewportWidth * 0.3) continue;
         const rect = el.getBoundingClientRect();
@@ -132,11 +325,129 @@ function isCoveredClampedTail(sourceTopCss, viewportHeight, coveredHeight, actua
         if (visibleWidth < viewportWidth * 0.25 || visibleHeight < viewportHeight * 0.25) continue;
         const visibleAreaRatio = visibleWidth * visibleHeight / (viewportWidth * viewportHeight);
         const score = range * (0.5 + visibleAreaRatio);
-        if (score > bestScore) { bestScore = score; scroller = el; }
+        scrollCandidates.push({ element: el, range, score });
       }
-
-      const elementRange = scroller ? Math.max(0, scroller.scrollHeight - scroller.clientHeight) : 0;
-      activeScroller = scroller && (windowRange < 32 || elementRange > windowRange * 1.15) ? scroller : null;
+      scrollCandidates.sort((a, b) => b.score - a.score);
+      // Keep a second, less restrictive inventory for the trusted-wheel
+      // probe. ChatGPT can place its conversation scroller inside a transformed
+      // shell whose visible size/overflow styles fail the initial candidate
+      // filters. If that happens, the old path saw windowRange=0, skipped the
+      // real owner, and silently reported a successful 1/1 viewport capture.
+      const allLiveScrollers = collectLiveCaptureScrollers(document);
+      const describeScroller = (el) => {
+        const rect = el.getBoundingClientRect();
+        const className = typeof el.className === "string" ? el.className.trim().replace(/\s+/g, ".").slice(0, 180) : "";
+        return {
+          node: `${el.tagName?.toLowerCase() || "element"}${el.id ? `#${el.id}` : ""}${className ? `.${className}` : ""}`,
+          connected: el.isConnected,
+          scrollTop: Math.round(el.scrollTop),
+          scrollLeft: Math.round(el.scrollLeft),
+          scrollHeight: el.scrollHeight,
+          clientHeight: el.clientHeight,
+          range: Math.max(0, el.scrollHeight - el.clientHeight),
+          overflowY: getComputedStyle(el).overflowY,
+          flexDirection: getComputedStyle(el).flexDirection,
+          scrollModel: isReverseCaptureScroller(el) ? "reverse-negative-scrollTop" : "normal-positive-scrollTop",
+          rect: { x: Math.round(rect.x), y: Math.round(rect.y), width: Math.round(rect.width), height: Math.round(rect.height) }
+        };
+      };
+      sendProgress(jobId, null, "", "", {
+        event: "page-inventory",
+        page: { origin: location.origin, path: location.pathname, title, viewport: { width: viewportWidth, height: viewportHeight, dpr: window.devicePixelRatio || 1 },
+          document: { width: pageWidth, height: pageHeight, windowRange } },
+        browser: navigator.userAgent,
+        filteredCandidates: scrollCandidates.slice(0, 20).map((item) => describeScroller(item.element)),
+        allScrollableElements: allLiveScrollers.slice(0, 80).map(describeScroller)
+      });
+      // Choose by observed behavior, not by comparing estimated document and
+      // element heights. SPA shells such as ChatGPT can report similar ranges
+      // for window and the real conversation scroller while only the latter
+      // actually moves.
+      activeScroller = await selectCaptureScrollContainer(window, windowRange, scrollCandidates, document.scrollingElement, body);
+      if (!activeScroller) {
+        const probeX = Math.min(viewportWidth - 1, Math.max(0, Math.round(viewportWidth * 0.68)));
+        const probeY = Math.min(viewportHeight - 1, Math.max(0, Math.round(viewportHeight * 0.45)));
+        const pointCandidates = [];
+        for (let node = document.elementFromPoint(probeX, probeY); node && node !== body; node = node.parentElement) {
+          if (node.scrollHeight - node.clientHeight > 32) pointCandidates.push(node);
+        }
+        const wheelCandidates = [...pointCandidates, ...scrollCandidates.map((candidate) => candidate.element), ...allLiveScrollers];
+        const wheelProbe = await probeCaptureWheelScrollContainer(window, wheelCandidates, document.scrollingElement,
+          async (deltaY) => {
+            const response = await chrome.runtime.sendMessage({
+              type: "scroll-capture-by-wheel", jobId,
+              x: probeX, y: probeY, deltaY
+            });
+            if (response?.ok) await sleep(180);
+            return response?.ok === true;
+          },
+          async () => sleep(60), document
+        );
+        if (wheelProbe.moved) captureScrollInputPoint = { x: probeX, y: probeY };
+        const hit = document.elementFromPoint(probeX, probeY);
+        scrollProbeDiagnostics = `wheel=${wheelProbe.dispatched ? "已送出" : "未送出"}；位置=${probeX},${probeY}；命中=${hit?.tagName?.toLowerCase() || "無"}${hit?.id ? `#${hit.id}` : ""}；位移=${wheelProbe.movement}；DOM可捲動元素=${allLiveScrollers.length}`;
+        if (wheelProbe.scroller) {
+          activeScroller = wheelProbe.scroller;
+        } else if (wheelProbe.windowMoved) {
+          // The first measurement may have happened while an SPA still had a
+          // viewport-sized document shell. Once the wheel proves that the
+          // window itself scrolls, refresh BOTH values used for canvas sizing;
+          // updating only windowRange creates a viewport-height "full page".
+          pageHeight = getCaptureDocumentHeight(root, body);
+          windowRange = Math.max(0, pageHeight - viewportHeight);
+        } else if (windowRange > 32 && wheelProbe.attempted && !wheelProbe.moved) {
+          throw new Error(`找不到可驗證的頁面捲動來源；${scrollProbeDiagnostics}；候選數=${wheelCandidates.length}。為避免下載不完整圖片，已停止。`);
+        }
+        sendProgress(jobId, null, "", "", { event: "wheel-preflight", diagnostic: scrollProbeDiagnostics,
+          selectedScroller: activeScroller ? describeScroller(activeScroller) : null,
+          window: { scrollY: window.scrollY, range: windowRange }, inputPoint: captureScrollInputPoint });
+      }
+      // A successful programmatic scrollTop probe is not proof that a SPA
+      // actually uses that node. In particular, ChatGPT can contain large
+      // inert/clipped DIVs whose scrollTop accepts values but whose user scroll
+      // is owned by another node. Verify every selected element with a real
+      // browser wheel event before sizing or stitching the output.
+      if (activeScroller) {
+        const probeX = Math.min(viewportWidth - 1, Math.max(0, Math.round(viewportWidth * 0.68)));
+        const probeY = Math.min(viewportHeight - 1, Math.max(0, Math.round(viewportHeight * 0.45)));
+        const pointCandidates = [];
+        for (let node = document.elementFromPoint(probeX, probeY); node && node !== body; node = node.parentElement) {
+          if (node.scrollHeight - node.clientHeight > 32) pointCandidates.push(node);
+        }
+        const wheelProbe = await probeCaptureWheelScrollContainer(window, [
+          ...pointCandidates,
+          activeScroller,
+          ...scrollCandidates.map((candidate) => candidate.element),
+          ...allLiveScrollers
+        ], document.scrollingElement, async (deltaY) => {
+          const response = await chrome.runtime.sendMessage({
+            type: "scroll-capture-by-wheel", jobId,
+            x: probeX, y: probeY, deltaY
+          });
+          if (response?.ok) await sleep(180);
+          return response?.ok === true;
+        }, async () => sleep(60), document);
+        if (wheelProbe.moved) captureScrollInputPoint = { x: probeX, y: probeY };
+        const hit = document.elementFromPoint(probeX, probeY);
+        scrollProbeDiagnostics = `已選容器=${activeScroller.tagName.toLowerCase()}${activeScroller.id ? `#${activeScroller.id}` : ""}；range=${Math.max(0, activeScroller.scrollHeight - activeScroller.clientHeight)}；wheel=${wheelProbe.dispatched ? "已送出" : "未送出"}；位置=${probeX},${probeY}；命中=${hit?.tagName?.toLowerCase() || "無"}${hit?.id ? `#${hit.id}` : ""}；位移=${wheelProbe.movement}；DOM可捲動元素=${allLiveScrollers.length}`;
+        if (!wheelProbe.moved && windowRange > 32) {
+          throw new Error(`捲動來源預檢未通過；${scrollProbeDiagnostics}；候選數=${scrollCandidates.length}。請將這段診斷回傳，以便精確修正；本次未產生長圖。`);
+        }
+        if (wheelProbe.scroller) activeScroller = wheelProbe.scroller;
+        else if (wheelProbe.windowMoved) {
+          activeScroller = null;
+          pageHeight = getCaptureDocumentHeight(root, body);
+          windowRange = Math.max(0, pageHeight - viewportHeight);
+        }
+        sendProgress(jobId, null, "", "", { event: "selected-scroller-verified", diagnostic: scrollProbeDiagnostics,
+          selectedScroller: activeScroller ? describeScroller(activeScroller) : null,
+          window: { scrollY: window.scrollY, range: windowRange }, inputPoint: captureScrollInputPoint });
+      }
+      activeScrollerIsReversed = isReverseCaptureScroller(activeScroller);
+      sendProgress(jobId, null, "", "", { event: "scroll-model-detected",
+        model: activeScrollerIsReversed ? "reverse-negative-scrollTop" : "normal-positive-scrollTop",
+        scroller: activeScroller ? describeScroller(activeScroller) : { node: "window" } });
+      const elementRange = activeScroller ? Math.max(0, activeScroller.scrollHeight - activeScroller.clientHeight) : 0;
       const scrollRange = activeScroller ? elementRange : windowRange;
       const captureStepHeight = activeScroller ? activeScroller.clientHeight : viewportHeight;
       // Unknown or data-heavy pages use the proven conservative stride. A
@@ -144,8 +455,27 @@ function isCoveredClampedTail(sourceTopCss, viewportHeight, coveredHeight, actua
       // non-table page; see the mutation probe before the capture loop.
       const conservativeStride = Math.max(80, Math.min(180, Math.floor(captureStepHeight * 0.16)));
       let captureStepStride = conservativeStride;
-      const width = activeScroller ? viewportWidth : pageWidth;
-      let height = activeScroller ? viewportHeight + scrollRange : pageHeight;
+      const chatGPTContentCapture = Boolean(activeScroller && /(^|\.)chatgpt\.com$/i.test(location.hostname));
+      const scrollerRect = chatGPTContentCapture ? activeScroller.getBoundingClientRect() : null;
+      const captureRect = chatGPTContentCapture ? {
+        left: Math.max(0, scrollerRect.left),
+        top: Math.max(0, scrollerRect.top),
+        width: Math.max(1, Math.min(viewportWidth, scrollerRect.right) - Math.max(0, scrollerRect.left)),
+        height: Math.max(1, Math.min(viewportHeight, scrollerRect.bottom) - Math.max(0, scrollerRect.top))
+      } : { left: 0, top: 0, width: viewportWidth, height: viewportHeight };
+      const captureViewportHeight = chatGPTContentCapture
+        ? Math.min(activeScroller.clientHeight, captureRect.height)
+        : viewportHeight;
+      // Preserve the visible left rail once at the top of the finished image.
+      // It is fixed UI, so copying it into every 125 px overlap tile caused
+      // repeated navigation labels; omitting it entirely made the v2.5.32
+      // content-only crop lose the user's left-column context.
+      const chatGPTLayout = chatGPTContentCapture
+        ? getChatGPTCaptureLayout(captureRect)
+        : { sidebarWidth: 0, contentWidth: viewportWidth, outputWidth: activeScroller ? viewportWidth : pageWidth };
+      const chatGPTSidebarWidth = chatGPTLayout.sidebarWidth;
+      const width = chatGPTLayout.outputWidth;
+      let height = activeScroller ? captureViewportHeight + scrollRange : pageHeight;
       scrollerOriginal = activeScroller ? {
         x: activeScroller.scrollLeft,
         y: activeScroller.scrollTop,
@@ -153,7 +483,7 @@ function isCoveredClampedTail(sourceTopCss, viewportHeight, coveredHeight, actua
       } : null;
       if (activeScroller) {
         activeScroller.style.scrollBehavior = "auto";
-        activeScroller.scrollTo(0, 0);
+        activeScroller.scrollTo(0, getCapturePhysicalScrollY(0, scrollRange, activeScrollerIsReversed));
       } else window.scrollTo(0, 0);
 
       const dpr = window.devicePixelRatio || 1;
@@ -190,7 +520,7 @@ function isCoveredClampedTail(sourceTopCss, viewportHeight, coveredHeight, actua
         const tall = rect.height >= viewportHeight * 0.35;
         return edge && narrow && tall && (isSidebarIdentity(el) || style.position === "fixed" || style.position === "sticky");
       };
-      const sidebarCandidates = [...document.querySelectorAll("body *")]
+      const sidebarCandidates = chatGPTContentCapture ? [] : [...document.querySelectorAll("body *")]
         .filter((el) => isVisible(el) && isPersistentSidePanel(el));
       const persistentSidePanelRoots = sidebarCandidates.filter((el) => {
         for (let parent = el.parentElement; parent && parent !== body; parent = parent.parentElement) {
@@ -235,7 +565,58 @@ function isCoveredClampedTail(sourceTopCss, viewportHeight, coveredHeight, actua
       const isRelatedToPersistentSidePanel = (el) => persistentSidePanelRoots.some((rootEl) =>
         rootEl === el || rootEl.contains(el) || el.contains(rootEl)
       );
-      const outputScaleX = outputWidth / Math.max(1, viewportWidth);
+      if (chatGPTContentCapture) {
+        // The full page screenshot includes the ChatGPT sidebar, fixed composer,
+        // and floating controls in every small overlap tile. Capture only the
+        // measured conversation viewport and temporarily hide those controls.
+        const candidates = new Set();
+        for (const form of document.querySelectorAll("form,[data-testid*='composer'],[data-testid*='prompt']")) {
+          const rect = form.getBoundingClientRect();
+          if (isVisible(form, rect) && rect.bottom >= viewportHeight * 0.55 && rect.height <= 280 &&
+              rect.width >= viewportWidth * 0.25) candidates.add(form);
+        }
+        for (const editor of document.querySelectorAll("textarea,[contenteditable]:not([contenteditable='false'])")) {
+          const rect = editor.getBoundingClientRect();
+          if (!isVisible(editor, rect) || rect.bottom < viewportHeight * 0.55 || rect.height > 180) continue;
+          const form = editor.closest("form");
+          let overlay = form || editor;
+          // Some ChatGPT builds use nested DIVs instead of a FORM. Walk only
+          // the compact bottom composer subtree, never the whole scroll pane.
+          for (let parent = overlay.parentElement; parent && parent !== activeScroller && parent !== body; parent = parent.parentElement) {
+            const parentRect = parent.getBoundingClientRect();
+            if (parentRect.height > 280) break;
+            if (parentRect.bottom >= viewportHeight * 0.55 && parentRect.width >= viewportWidth * 0.25) overlay = parent;
+          }
+          const overlayRect = overlay.getBoundingClientRect();
+          if (overlayRect.height <= 280 && overlayRect.bottom >= viewportHeight * 0.55 &&
+              overlayRect.width >= viewportWidth * 0.25) candidates.add(overlay);
+        }
+        for (const el of document.querySelectorAll("button,[role='button']")) {
+          const rect = el.getBoundingClientRect();
+          const style = getComputedStyle(el);
+          const label = `${el.getAttribute("aria-label") || ""} ${el.getAttribute("data-testid") || ""}`;
+          const centerX = captureRect.left + captureRect.width / 2;
+          const centerControl = rect.width <= 100 && rect.height <= 100 && rect.top >= viewportHeight * 0.55 &&
+            Math.abs((rect.left + rect.width / 2) - centerX) <= Math.max(80, captureRect.width * 0.08);
+          const floatingControl = ["fixed", "sticky", "absolute"].includes(style.position) && rect.width <= 120 && rect.height <= 120 &&
+            (rect.top >= viewportHeight * 0.62 || rect.right >= viewportWidth * 0.94 || centerControl);
+          const scrollControl = /scroll.*bottom|bottom.*scroll|scroll-to-bottom|jump.*latest|latest.*message/i.test(label);
+          if (isVisible(el, rect) && (floatingControl || scrollControl)) candidates.add(el);
+        }
+        const roots = [...candidates].filter((el) => ![...candidates].some((other) => other !== el && other.contains(el)));
+        chatGPTHiddenUi = roots.map((element) => ({ element,
+          visibility: element.style.getPropertyValue("visibility"),
+          priority: element.style.getPropertyPriority("visibility") }));
+        for (const item of chatGPTHiddenUi) item.element.style.setProperty("visibility", "hidden", "important");
+        sendProgress(jobId, null, "", "", { event: "chatgpt-ui-filter", contentRect: captureRect,
+          hiddenControls: chatGPTHiddenUi.map(({ element }) => {
+            const rect = element.getBoundingClientRect();
+            return { tag: element.tagName?.toLowerCase(), testId: element.getAttribute?.("data-testid") || "",
+              label: element.getAttribute?.("aria-label") || "", position: getComputedStyle(element).position,
+              rect: { x: Math.round(rect.x), y: Math.round(rect.y), width: Math.round(rect.width), height: Math.round(rect.height) } };
+          }) });
+      }
+      const outputScaleX = outputWidth / Math.max(1, chatGPTContentCapture ? width : viewportWidth);
       for (let partIndex = 0; partIndex < partCount; partIndex++) {
         const startCss = partIndex * partCssHeight;
         const heightCss = Math.min(partCssHeight, height - startCss);
@@ -301,8 +682,14 @@ function isCoveredClampedTail(sourceTopCss, viewportHeight, coveredHeight, actua
         }
       };
 
-      const setScrollY = (value) => activeScroller ? activeScroller.scrollTo(0, value) : window.scrollTo(0, value);
-      const getScrollY = () => activeScroller ? activeScroller.scrollTop : window.scrollY;
+      const setScrollY = (value) => activeScroller
+        ? activeScroller.scrollTo(0, getCapturePhysicalScrollY(value,
+          Math.max(0, activeScroller.scrollHeight - activeScroller.clientHeight), activeScrollerIsReversed))
+        : window.scrollTo(0, value);
+      const getScrollY = () => activeScroller
+        ? getCaptureLogicalScrollY(activeScroller, activeScrollerIsReversed,
+          Math.max(0, activeScroller.scrollHeight - activeScroller.clientHeight))
+        : window.scrollY;
       const getMaxScrollY = () => activeScroller
         ? Math.max(0, activeScroller.scrollHeight - activeScroller.clientHeight)
         : Math.max(0, Math.max(root.scrollHeight, body.scrollHeight || 0, root.clientHeight) - viewportHeight);
@@ -318,25 +705,109 @@ function isCoveredClampedTail(sourceTopCss, viewportHeight, coveredHeight, actua
         // The popup no longer needs a visible animation. Instant positioning
         // avoids spending hundreds of milliseconds animating every small tile;
         // we still verify the settled position and wait for page rendering.
-        if (activeScroller) activeScroller.scrollTop = targetY;
+        if (activeScroller) setScrollY(targetY);
         else window.scrollTo(0, targetY);
         const start = performance.now();
         let settledFrames = 0;
+        let wheelFallbackAttempts = 0;
+        let lastWheelFallbackAt = 0;
         while (performance.now() - start < 5000) {
           await sleep(50);
-          if (Math.abs(getScrollY() - targetY) <= 3) {
+          let observedY = getScrollY();
+          const withinWheelSettleWindow = evaluateCaptureScrollClamp(
+            requestedY, getMaxScrollY(), observedY, bottomTolerance, previousY
+          ).settledNearTarget;
+          if (targetY > previousY + 3 && !withinWheelSettleWindow &&
+              performance.now() - start >= 350 && performance.now() - lastWheelFallbackAt >= 300 &&
+              wheelFallbackAttempts < 6 && backgroundMode === "debugger") {
+            wheelFallbackAttempts++;
+            lastWheelFallbackAt = performance.now();
+            const windowBeforeWheel = window.scrollY;
+            const documentScroller = document.scrollingElement;
+            const documentBeforeWheel = documentScroller?.scrollTop || 0;
+            const liveScrollers = collectLiveCaptureScrollers(document);
+            const candidatePositions = new Map(liveScrollers.map((element) => [element, element.scrollTop]));
+            try {
+              const wheelDeltaY = Math.max(160, targetY - getScrollY());
+              const wheelResult = await chrome.runtime.sendMessage({
+                type: "scroll-capture-by-wheel",
+                jobId,
+                // Use the exact point that the preflight proved scrollable.
+                // The viewport center can hit a code block, toolbar, or a
+                // different nested pane on ChatGPT and leave the main feed at 0.
+                x: captureScrollInputPoint?.x ?? Math.round(viewportWidth * 0.68),
+                y: captureScrollInputPoint?.y ?? Math.round(viewportHeight * 0.45),
+                // ChatGPT may ignore scrollTop writes on its application shell.
+                // Its verified wheel target can move by only ~2/3 of deltaY,
+                // so send at least one full 160 px wheel quantum and retry
+                // against the measured position until the requested overlap
+                // is reached. Stitching always uses the resulting actualY.
+                deltaY: wheelDeltaY
+              });
+              let movedCandidate = null;
+              if (wheelResult?.ok) {
+                await sleep(180);
+                if (window.scrollY > windowBeforeWheel + 3) {
+                  activeScroller = null;
+                  activeScrollerIsReversed = false;
+                } else if (documentScroller && documentScroller.scrollTop > documentBeforeWheel + 3) {
+                  activeScroller = documentScroller;
+                  activeScrollerIsReversed = isReverseCaptureScroller(activeScroller);
+                } else {
+                  movedCandidate = findMovedCaptureScroller(document, candidatePositions, 1);
+                  if (movedCandidate) {
+                    activeScroller = movedCandidate.element;
+                    activeScrollerIsReversed = isReverseCaptureScroller(activeScroller);
+                  }
+                }
+                observedY = getScrollY();
+              }
+              const largestChanges = [...candidatePositions.entries()]
+                .map(([element, before]) => ({ element, before, after: element.scrollTop, delta: element.scrollTop - before }))
+                .filter((item) => Math.abs(item.delta) > 2)
+                .sort((a, b) => Math.abs(b.delta) - Math.abs(a.delta)).slice(0, 8)
+                .map((item) => ({ node: describeScroller(item.element), before: item.before, after: item.after, delta: item.delta }));
+              sendProgress(jobId, null, "", "", { event: "wheel-fallback-attempt", attempt: wheelFallbackAttempts,
+                responseOk: wheelResult?.ok === true, requestedY, beforeY: previousY, observedY,
+                deltaY: wheelDeltaY, point: captureScrollInputPoint, windowBefore: windowBeforeWheel, windowAfter: window.scrollY,
+                documentScrollerBefore: documentBeforeWheel, documentScrollerAfter: documentScroller?.scrollTop || 0,
+                activeScrollerAfter: activeScroller ? describeScroller(activeScroller) : { node: "window", scrollY: window.scrollY },
+                movedCandidate: movedCandidate ? describeScroller(movedCandidate.element) : null, changedNodes: largestChanges });
+            } catch (error) {
+              sendProgress(jobId, null, "", "", { event: "wheel-fallback-error", attempt: wheelFallbackAttempts,
+                message: error?.message || String(error), stack: error?.stack || "" });
+              console.warn("CDP 滾輪捲動備援失敗：", error);
+            }
+          }
+          const currentPolicy = evaluateCaptureScrollClamp(
+            requestedY, getMaxScrollY(), observedY, bottomTolerance, previousY
+          );
+          if (Math.abs(observedY - targetY) <= 3 || currentPolicy.settledNearTarget) {
             if (++settledFrames >= 3) break;
           } else settledFrames = 0;
         }
         const actualY = getScrollY();
         const currentMaxY = getMaxScrollY();
+        sendProgress(jobId, null, "", "", { event: "scroll-settled", requestedY, targetY, actualY, currentMaxY,
+          previousY, elapsedMs: Math.round(performance.now() - start), wheelFallbackAttempts,
+          owner: activeScroller ? describeScroller(activeScroller) : { node: "window", scrollY: window.scrollY, range: currentMaxY },
+          inputPoint: captureScrollInputPoint });
         // Browsers can clamp a requested final position by more than a fixed
         // pixel tolerance when lazy content changes the document height.
         // Accept the discrepancy only when the page really reached its live
         // maximum; a mid-page stall still fails closed.
         const scrollPolicy = evaluateCaptureScrollClamp(requestedY, currentMaxY, actualY, bottomTolerance, previousY);
         if (Math.abs(actualY - targetY) > 3 && !scrollPolicy.reachedBottom && !scrollPolicy.settledNearTarget) {
-          throw new Error(`網頁沒有捲動到第 ${Math.round(targetY)} px（目前 ${Math.round(actualY)} px），已停止以免重複截取同一畫面。`);
+          const elementLabel = (element) => {
+            const id = element?.id ? `#${element.id}` : "";
+            const className = typeof element?.className === "string"
+              ? `.${element.className.trim().split(/\s+/).filter(Boolean).slice(0, 3).join(".")}` : "";
+            return `${element?.tagName?.toLowerCase?.() || "element"}${id}${className}${element?.isConnected === false ? "（已脫離 DOM）" : ""}`;
+          };
+          const owner = activeScroller
+            ? `${elementLabel(activeScroller)}（scrollTop ${Math.round(activeScroller.scrollTop)} / range ${Math.max(0, activeScroller.scrollHeight - activeScroller.clientHeight)}）`
+            : `window（scrollY ${Math.round(window.scrollY)} / range ${Math.round(getMaxScrollY())}）`;
+          throw new Error(`網頁沒有捲動到第 ${Math.round(targetY)} px（目前 ${Math.round(actualY)} px）；實際追蹤容器 ${owner}；滾輪重試 ${wheelFallbackAttempts}/6 次；背景模式 ${backgroundMode}；預檢：${scrollProbeDiagnostics}。已停止以免重複截取同一畫面。`);
         }
         if (scrollPolicy.reachedBottom || (requestedY > actualY + 3 && actualY >= currentMaxY - 3)) {
           bottomClampPx = Math.max(bottomClampPx, requestedY - actualY);
@@ -395,7 +866,7 @@ function isCoveredClampedTail(sourceTopCss, viewportHeight, coveredHeight, actua
         const isLastPlannedSegment = i === uniqueSteps.length - 1;
         const frontierTarget = i === 0
           ? 0
-          : getNextCaptureTarget(outputCoveredCss, viewportHeight, captureStepStride, i === 1);
+          : getNextCaptureTarget(outputCoveredCss, captureViewportHeight, captureStepStride, i === 1);
         // Keep the preflight segment count as an estimate, but align every
         // interior capture to the pixels already covered. The last segment
         // still reaches the live page tail, including a page that expanded.
@@ -411,13 +882,15 @@ function isCoveredClampedTail(sourceTopCss, viewportHeight, coveredHeight, actua
         // Static pages verified by the reversible probe need less paint time;
         // keep the longer delay on dynamic/unknown pages to avoid missing rows.
         await sleep(fastStaticStride ? 110 : 260);
-        const captureOptions = { format: imageOptions.captureFormat };
-        if (imageOptions.captureFormat === "jpeg") captureOptions.quality = imageOptions.quality;
-        const captured = await captureSegmentWithRetry(jobId, windowId, captureOptions, `第 ${i + 1} 段`);
+        const captured = await captureSegmentWithRetry(jobId, windowId, segmentCaptureOptions, `第 ${i + 1} 段`);
         const image = await loadImage(captured.dataUrl);
-        const sourceScaleY = image.height / Math.max(1, viewportHeight);
+        sendProgress(jobId, null, "", "", { event: "segment-captured", segment: i + 1, total: uniqueSteps.length,
+          scrollY: actualY, image: { width: image.width, height: image.height }, outputCoveredCss,
+          sourceOrigin: captured.source || "debugger-or-tab-capture", segmentFormat: "png-lossless" });
+        const sourceRect = mapCaptureRectToPixels(captureRect, image.width, image.height, viewportWidth, viewportHeight);
+        const sourceScaleY = sourceRect.scaleY;
         const sourceTopCss = i === 0 ? 0 : outputCoveredCss - actualY;
-        if (isCoveredClampedTail(sourceTopCss, viewportHeight, outputCoveredCss, actualY, getMaxScrollY(), bottomClampPx)) {
+        if (isCoveredClampedTail(sourceTopCss, captureViewportHeight, outputCoveredCss, actualY, getMaxScrollY(), bottomClampPx)) {
           // At a short-clamped page tail this frame adds no pixels: the prior
           // tile already reaches the actual visible bottom. The reported max
           // may be a few pixels too large (e.g. 4099 vs 4068); skip this empty
@@ -425,28 +898,42 @@ function isCoveredClampedTail(sourceTopCss, viewportHeight, coveredHeight, actua
           image.close?.();
           break;
         }
-        if (sourceTopCss < -2 || sourceTopCss >= viewportHeight) {
+        if (sourceTopCss < -2 || sourceTopCss >= captureViewportHeight) {
           image.close?.();
-          throw new Error(`拼接位置不連續（第 ${i + 1} 段：要求 ${Math.round(y)} px、實際 ${Math.round(actualY)} px、已覆蓋 ${Math.round(outputCoveredCss)} px、視窗 ${Math.round(viewportHeight)} px），已停止以免輸出缺列。`);
+          throw new Error(`拼接位置不連續（第 ${i + 1} 段：要求 ${Math.round(y)} px、實際 ${Math.round(actualY)} px、已覆蓋 ${Math.round(outputCoveredCss)} px、視窗 ${Math.round(captureViewportHeight)} px），已停止以免輸出缺列。`);
         }
         const firstTileLimit = i === 0
-          ? (uniqueSteps.length === 1 || fastStaticStride ? Math.min(height, captureStepHeight) : Math.max(1, captureStepHeight - captureStepStride))
-          : viewportHeight - sourceTopCss;
-        const drawCssHeight = Math.min(firstTileLimit, viewportHeight - sourceTopCss, height - outputCoveredCss);
+          ? (uniqueSteps.length === 1 || fastStaticStride ? Math.min(height, captureViewportHeight) : Math.max(1, captureViewportHeight - captureStepStride))
+          : captureViewportHeight - sourceTopCss;
+        const drawCssHeight = Math.min(firstTileLimit, captureViewportHeight - sourceTopCss, height - outputCoveredCss);
         if (drawCssHeight <= 0) { image.close?.(); break; }
-        const sourcePixelTop = Math.round(Math.max(0, sourceTopCss) * sourceScaleY);
+        const sourcePixelTop = sourceRect.y + Math.round(Math.max(0, sourceTopCss) * sourceScaleY);
+        const sourcePixelLeft = sourceRect.x;
+        const sourcePixelWidth = Math.min(image.width - sourcePixelLeft, sourceRect.width);
         const sourcePixelHeight = Math.min(image.height - sourcePixelTop, Math.round(drawCssHeight * sourceScaleY));
         const destinationPixelHeight = Math.round(drawCssHeight * dpr);
         if (sourcePixelHeight <= 0 || destinationPixelHeight <= 0) {
           image.close?.();
           throw new Error(`第 ${i + 1} 段截圖高度無效，已停止以免下載不完整長圖。`);
         }
-        drawAcrossParts(image, 0, sourcePixelTop, image.width, sourcePixelHeight,
-          0, outputCoveredCss, width, drawCssHeight, true);
+        if (chatGPTContentCapture && i === 0 && chatGPTSidebarWidth > 0) {
+          const railHeightCss = Math.min(viewportHeight, height);
+          const railWidthPixels = Math.min(image.width, Math.round(chatGPTSidebarWidth * sourceRect.scaleX));
+          const railHeightPixels = Math.min(image.height, Math.round(railHeightCss * sourceScaleY));
+          drawAcrossParts(image, 0, 0, railWidthPixels, railHeightPixels,
+            0, 0, chatGPTSidebarWidth, railHeightCss, false);
+          sendProgress(jobId, null, "", "", { event: "chatgpt-sidebar-preserved-once",
+            width: chatGPTSidebarWidth, height: railHeightCss });
+        }
+        const mainDestinationX = chatGPTContentCapture ? chatGPTSidebarWidth : 0;
+        drawAcrossParts(image, sourcePixelLeft, sourcePixelTop, sourcePixelWidth, sourcePixelHeight,
+          mainDestinationX, outputCoveredCss, chatGPTContentCapture ? chatGPTLayout.contentWidth : width, drawCssHeight, true);
         outputCoveredCss += drawCssHeight;
+        sendProgress(jobId, null, "", "", { event: "segment-stitched", segment: i + 1, total: uniqueSteps.length,
+          drawCssHeight, outputCoveredCss, pageHeight: height, dimensions: { width: outputWidth, height: outputHeight } });
         image.close?.();
         await flushCompleteParts(outputCoveredCss);
-        if (actualY >= getMaxScrollY() - 3 && outputCoveredCss >= viewportHeight + getMaxScrollY() - 2) {
+        if (actualY >= getMaxScrollY() - 3 && outputCoveredCss >= captureViewportHeight + getMaxScrollY() - 2) {
           // The live page reached its bottom before the preflight segment
           // estimate. It has been fully covered, so do not revisit the same
           // viewport for the remaining stale planned tiles.
@@ -461,12 +948,12 @@ function isCoveredClampedTail(sourceTopCss, viewportHeight, coveredHeight, actua
       // captured pixels intact; do not synthesize or stretch image data.
       {
         const reportedLiveDocumentHeight = activeScroller
-          ? viewportHeight + getMaxScrollY()
+          ? captureViewportHeight + getMaxScrollY()
           : Math.max(root.scrollHeight, body.scrollHeight || 0, root.clientHeight);
         const nearClampedBottom = bottomClampPx > 0 && bottomClampPx <= 64 &&
           getScrollY() >= getMaxScrollY() - bottomClampPx - 3;
         const liveDocumentHeight = nearClampedBottom
-          ? Math.min(reportedLiveDocumentHeight, getScrollY() + viewportHeight)
+          ? Math.min(reportedLiveDocumentHeight, getScrollY() + captureViewportHeight)
           : reportedLiveDocumentHeight;
         if (canTrimCaptureTail(height, liveDocumentHeight, outputCoveredCss, getScrollY(), getMaxScrollY(), bottomClampPx)) {
           height = liveDocumentHeight;
@@ -518,8 +1005,7 @@ function isCoveredClampedTail(sourceTopCss, viewportHeight, coveredHeight, actua
       if (bottomGap > 2 && bottomClampPx > 0 && bottomGap <= bottomClampPx + 2) {
         if (activeScroller) throw new Error("內部捲動頁尾仍有像素未覆蓋；為避免裁掉資料，已取消下載。");
         const tailCapture = await captureSegmentWithRetry(jobId, windowId, {
-          format: imageOptions.captureFormat,
-          ...(imageOptions.captureFormat === "jpeg" ? { quality: imageOptions.quality } : {}),
+          ...segmentCaptureOptions,
           ...(backgroundMode === "debugger" ? { clip: { x: 0, y: outputCoveredCss, width, height: bottomGap, scale: 1 } } : {})
         }, "頁尾補擷取");
         const tailImage = await loadImage(tailCapture.dataUrl);
@@ -559,9 +1045,7 @@ function isCoveredClampedTail(sourceTopCss, viewportHeight, coveredHeight, actua
           }
           if (persistentSidePanelRegions.some((panel) => panel.scroller)) await sleep(200);
           await sleep(fastStaticStride ? 110 : 260);
-          const captureOptions = { format: imageOptions.captureFormat };
-          if (imageOptions.captureFormat === "jpeg") captureOptions.quality = imageOptions.quality;
-          const captured = await captureSegmentWithRetry(jobId, windowId, captureOptions, `側欄第 ${index + 1} 段`);
+          const captured = await captureSegmentWithRetry(jobId, windowId, segmentCaptureOptions, `側欄第 ${index + 1} 段`);
           const image = await loadImage(captured.dataUrl);
           const sourceScaleX = image.width / Math.max(1, viewportWidth);
           const sourceScaleY = image.height / Math.max(1, viewportHeight);
@@ -630,6 +1114,7 @@ function isCoveredClampedTail(sourceTopCss, viewportHeight, coveredHeight, actua
         const filename = `HTML轉圖片/${safeFilename(title)}_${timestampLabel}${partSuffix}.${imageOptions.extension}`;
         const dataUrl = await blobToDataUrl(blob);
         const result = await transferImageForDownload(`${jobId}-${partIndex + 1}`, filename, dataUrl);
+        sendProgress(jobId, null, "", "", { event: "download-started", filename, bytes: blob.size, downloadId: result?.downloadId });
         if (!result?.ok) throw new Error(result?.message || `第 ${partIndex + 1} 張圖片下載失敗。`);
         downloads.push(result);
         sendProgress(jobId, { done: partIndex + 1, total: canvases.length, message: `已下載第 ${partIndex + 1} / ${canvases.length} 張` },
@@ -641,10 +1126,25 @@ function isCoveredClampedTail(sourceTopCss, viewportHeight, coveredHeight, actua
       for (const panel of persistentSidePanelRegions) {
         if (!panel.scroller) continue;
         panel.scroller.style.scrollBehavior = panel.originalScrollBehavior;
-        panel.scroller.scrollTop = panel.originalScrollTop;
+      }
+      for (const item of chatGPTHiddenUi) {
+        if (!item.element?.style) continue;
+        if (item.visibility) item.element.style.setProperty("visibility", item.visibility, item.priority || "");
+        else item.element.style.removeProperty("visibility");
       }
       root.style.scrollBehavior = original.behavior || "";
       root.style.overflow = original.overflow || "";
+      // Restore browser zoom before restoring the user's original scroll
+      // coordinates; zoom can reflow the page and change its scroll range.
+      if (debuggerSessionStarted) {
+        try { await chrome.runtime.sendMessage({ type: "end-full-page-capture-session", jobId }); }
+        catch (error) { console.warn("Could not release screenshot session:", error); }
+        debuggerSessionStarted = false;
+        if (zoomAdjustedForCapture) await sleep(220);
+      }
+      for (const panel of persistentSidePanelRegions) {
+        if (panel.scroller) panel.scroller.scrollTop = panel.originalScrollTop;
+      }
       if (activeScroller && scrollerOriginal) {
         activeScroller.style.scrollBehavior = scrollerOriginal.behavior || "";
         activeScroller.scrollTo(scrollerOriginal.x || 0, scrollerOriginal.y || 0);

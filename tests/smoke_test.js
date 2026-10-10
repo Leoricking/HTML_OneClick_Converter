@@ -6,7 +6,7 @@ const root = path.resolve(__dirname, "..");
 const read = (name) => fs.readFileSync(path.join(root, name), "utf8");
 
 const manifest = JSON.parse(read("manifest.json"));
-if (manifest.version !== "2.5.15") throw new Error("manifest version must be 2.5.15");
+if (manifest.version !== "2.5.35") throw new Error("manifest version must be 2.5.35");
 for (const permission of ["activeTab", "scripting", "downloads", "storage", "pageCapture", "clipboardWrite", "identity", "debugger"]) {
   if (!manifest.permissions.includes(permission)) throw new Error(`missing permission: ${permission}`);
 }
@@ -22,6 +22,34 @@ const captureSource = read("capture.js");
 const htmlIds = new Set([...html.matchAll(/\bid="([^"]+)"/g)].map((match) => match[1]));
 if (!(html.indexOf('id="capture-full"') < html.indexOf('id="progress"') && html.indexOf('id="progress"') < html.indexOf('id="save-page-pdf"'))) {
   throw new Error("full-page capture feedback must appear in the visible image-capture section");
+}
+if (!html.includes('id="copy-capture-log"') || !html.includes('id="capture-log-output"') ||
+    !popupSource.includes('get-full-page-capture-log') || !popupSource.includes('navigator.clipboard.writeText')) {
+  throw new Error("complete capture diagnostics must be visible and one-click copyable from the popup");
+}
+for (const marker of ["page-inventory", "wheel-preflight", "selected-scroller-verified", "wheel-fallback-attempt", "scroll-settled", "segment-captured", "segment-stitched", "download-started", "capture-error"]) {
+  if (!captureSource.includes(marker)) throw new Error(`complete capture diagnostic event missing: ${marker}`);
+}
+for (const marker of ["function isReverseCaptureScroller", "function getCaptureLogicalScrollY", "function getCapturePhysicalScrollY", "scroll-model-detected", "reverse-negative-scrollTop"]) {
+  if (!captureSource.includes(marker)) throw new Error(`reverse-scroll handling missing: ${marker}`);
+}
+for (const marker of ["chatGPTContentCapture", "event: \"chatgpt-ui-filter\"", "textarea,[contenteditable]:not([contenteditable='false'])", "document.querySelectorAll(\"form,[data-testid*='composer'],[data-testid*='prompt']\")", "mapCaptureRectToPixels(captureRect", "sourceRect.y + Math.round(Math.max(0, sourceTopCss)", "chatGPTContentCapture ? width : viewportWidth", "getChatGPTCaptureLayout(captureRect)", "chatgpt-sidebar-preserved-once", "const mainDestinationX = chatGPTContentCapture ? chatGPTSidebarWidth : 0", "jump.*latest"]) {
+  if (!captureSource.includes(marker)) throw new Error(`ChatGPT repeat-UI filtering missing: ${marker}`);
+}
+const chatGPTCrop = vm.runInNewContext(`${captureSource}\nmapCaptureRectToPixels({left:260,top:50,width:1400,height:780},3360,1680,1680,840)`, { chrome: { runtime: { onMessage: { addListener() {} } } } });
+if (chatGPTCrop.x !== 520 || chatGPTCrop.y !== 100 || chatGPTCrop.width !== 2800 || chatGPTCrop.height !== 1560) {
+  throw new Error("ChatGPT conversation crop must map CSS viewport coordinates to screenshot pixels without stretching");
+}
+const chatGPTLayout = vm.runInNewContext(`${captureSource}\ngetChatGPTCaptureLayout({left:260,width:1400})`, { chrome: { runtime: { onMessage: { addListener() {} } } } });
+if (chatGPTLayout.sidebarWidth !== 260 || chatGPTLayout.contentWidth !== 1400 || chatGPTLayout.outputWidth !== 1660) {
+  throw new Error("ChatGPT output layout must preserve the left rail once and keep the conversation at its original width");
+}
+const reverseScrollMath = vm.runInNewContext(`${captureSource}\n({top:getCapturePhysicalScrollY(0,4249,true), second:getCapturePhysicalScrollY(125,4249,true), logical:getCaptureLogicalScrollY({scrollTop:-4124},true,4249), normal:getCapturePhysicalScrollY(125,4249,false)})`, { chrome: { runtime: { onMessage: { addListener() {} } } } });
+if (reverseScrollMath.top !== -4249 || reverseScrollMath.second !== -4124 || reverseScrollMath.logical !== 125 || reverseScrollMath.normal !== 125) {
+  throw new Error("reverse ChatGPT scroll coordinates must map capture top-to-bottom correctly");
+}
+if (!backgroundSource.includes('type === "get-full-page-capture-log"') || !backgroundSource.includes("fullPageCaptureLog")) {
+  throw new Error("capture diagnostics must persist after popup close and be retrievable");
 }
 const referencedIds = new Set([...popupSource.matchAll(/\$\("([^"]+)"\)/g)].map((match) => match[1]));
 for (const id of referencedIds) {
@@ -122,7 +150,11 @@ const backgroundContext = {
       },
       detach: async (target) => { backgroundContext.debuggerDetached = target; }
     },
-    storage: { local: { get: async () => ({}), set: async () => {}, remove: async () => {} } },
+    storage: { local: {
+      get: async (defaults = {}) => ({ ...defaults, ...(backgroundContext.captureLogStore || {}) }),
+      set: async (values) => { backgroundContext.captureLogStore = { ...(backgroundContext.captureLogStore || {}), ...values }; },
+      remove: async () => {}
+    } },
     identity: { getRedirectURL: () => "https://test.chromiumapp.org/microsoft" },
     downloads: { download: (options, callback) => {
       backgroundContext.downloadRequests.push(options);
@@ -130,6 +162,9 @@ const backgroundContext = {
       return Promise.resolve(1);
     } },
     tabs: {
+      zoom: 1,
+      getZoom: async () => backgroundContext.chrome.tabs.zoom,
+      setZoom: async (_tabId, zoom) => { backgroundContext.chrome.tabs.zoom = zoom; },
       query: async () => [{ id: backgroundContext.activeTabId ?? 1, windowId: 1 }],
       captureVisibleTab: (_windowId, options, callback) => {
         backgroundContext.lastSegmentCaptureOptions = options;
@@ -168,6 +203,9 @@ for (const name of ["popup.html", "popup.js", "popup.css", "README.md", "VALIDAT
       !captureSource.includes("quotaLimited ? Math.min(8000, 1200 * attempt)")) {
     throw new Error("visible-tab fallback must serialize screenshots below Chromium's per-second capture quota and back off on quota errors");
   }
+  if (!captureSource.includes('type: "scroll-capture-by-wheel"') || !backgroundSource.includes('"Input.dispatchMouseEvent"')) {
+    throw new Error("stalled direct scrolling must have a trusted CDP mouse-wheel fallback");
+  }
   backgroundContext.visibleCaptureCalls = [];
   await Promise.all([
     vm.runInContext(`captureVisibleTabCompat(1,{format:"png"})`, backgroundContext),
@@ -180,6 +218,176 @@ for (const name of ["popup.html", "popup.js", "popup.css", "README.md", "VALIDAT
       !captureSource.includes("function canTrimCaptureTail") ||
       !captureSource.includes("const actualY = await scrollToAndWait(y)") || !captureSource.includes("outputCoveredCss - actualY")) {
     throw new Error("final-tail clamping must require the live scroll maximum, stitch using actual position, and trim only a matching short tail");
+  }
+  if (!captureSource.includes("async function probeCaptureScrollContainer") ||
+      !captureSource.includes("async function probeCaptureWindowScroll") ||
+      !captureSource.includes("async function selectCaptureScrollContainer") ||
+      !captureSource.includes("selectCaptureScrollContainer(window, windowRange, scrollCandidates, document.scrollingElement, body)") ||
+      !captureSource.includes("candidates.slice(0, 24)")) {
+    throw new Error("scroll source detection must select the window or an inner scroller by measured movement, not estimated height ratios");
+  }
+  const elementRangeMatch = captureSource.match(/const elementRange = ([^;]+);/);
+  if (!elementRangeMatch || /\bscroller\b/.test(elementRangeMatch[1])) {
+    throw new Error("element scroll range must use the selected activeScroller, not an undefined scroller variable");
+  }
+  const selectedRange = vm.runInNewContext(elementRangeMatch[1], {
+    activeScroller: { scrollHeight: 6200, clientHeight: 800 },
+    windowRange: 5000
+  });
+  const documentRange = vm.runInNewContext(elementRangeMatch[1], {
+    activeScroller: null,
+    windowRange: 5000
+  });
+  if (selectedRange !== 5400 || documentRange !== 0) {
+    throw new Error("element range calculation must work for both a selected scroller and window scrolling");
+  }
+  if (!captureSource.includes("async function probeCaptureWheelScrollContainer") ||
+      !captureSource.includes("document.elementFromPoint(probeX, probeY)") ||
+      !captureSource.includes('type: "scroll-capture-by-wheel", jobId')) {
+    throw new Error("a stalled main-content scroller must be discovered with a bounded wheel probe before capture dimensions are finalized");
+  }
+  if (!captureSource.includes("A successful programmatic scrollTop probe is not proof") ||
+      !captureSource.includes("findMovedCaptureScroller(documentObject, before, direction)")) {
+    throw new Error("scroll selection must be validated by actual browser wheel movement, not a writable scrollTop alone");
+  }
+  if (!captureSource.includes("function getCaptureDocumentHeight(root, body)") ||
+      (captureSource.match(/pageHeight = getCaptureDocumentHeight\(root, body\)/g) || []).length < 3) {
+    throw new Error("when wheel validation selects window scrolling, canvas height must be remeasured along with scroll range");
+  }
+  if (!captureSource.includes("let captureScrollInputPoint = null") ||
+      !captureSource.includes("if (wheelProbe.moved) captureScrollInputPoint = { x: probeX, y: probeY }") ||
+      !captureSource.includes("x: captureScrollInputPoint?.x ?? Math.round(viewportWidth * 0.68)") ||
+      !captureSource.includes("y: captureScrollInputPoint?.y ?? Math.round(viewportHeight * 0.45)")) {
+    throw new Error("capture retries must reuse the verified wheel hit-test point for every segment");
+  }
+  if (!captureSource.includes("let wheelFallbackAttempts = 0") ||
+      !captureSource.includes("wheelFallbackAttempts < 6") ||
+      !captureSource.includes("const wheelDeltaY = Math.max(160, targetY - getScrollY())") ||
+      !captureSource.includes("currentPolicy.settledNearTarget")) {
+    throw new Error("ChatGPT capture must retry the verified wheel target until measurable forward movement reaches the overlap tolerance");
+  }
+  const verifiedPartialProgress = vm.runInNewContext(`${captureSource}\nevaluateCaptureScrollClamp(125, 4249, 107, 24, 0)`, { chrome: { runtime: { onMessage: { addListener() {} } } } });
+  const noProgress = vm.runInNewContext(`${captureSource}\nevaluateCaptureScrollClamp(125, 4249, 0, 24, 0)`, { chrome: { runtime: { onMessage: { addListener() {} } } } });
+  if (!verifiedPartialProgress.settledNearTarget || noProgress.settledNearTarget) {
+    throw new Error("the reported 125 px target / 107 px trusted-wheel movement must be accepted as measured progress, while 0 px must not");
+  }
+  const heightHelper = captureSource.match(/function getCaptureDocumentHeight\(root, body\) \{[\s\S]*?\n\}/)?.[0];
+  if (!heightHelper) throw new Error("document height measurement helper missing");
+  const measuredHeight = vm.runInNewContext(`(${heightHelper})(root, body)`, {
+    root: { scrollHeight: 6240, clientHeight: 1000 }, body: { scrollHeight: 6100 }
+  });
+  if (measuredHeight !== 6240) throw new Error("document height must use the refreshed live root/body dimensions");
+  for (const diagnostic of ["scrollProbeDiagnostics", "命中=", "位移=${wheelProbe.movement}", "候選數=${scrollCandidates.length}"]) {
+    if (!captureSource.includes(diagnostic)) throw new Error(`scroll-owner failure must expose actionable UI diagnostics: ${diagnostic}`);
+  }
+  const wheelContext = { chrome: { runtime: { onMessage: { addListener() {} } } } };
+  const wheelOutcome = await vm.runInNewContext(`${captureSource}\n(async () => {
+    let position = 900;
+    const innerScroller = { scrollHeight: 2400, clientHeight: 800,
+      get scrollTop() { return position; }, set scrollTop(value) { position = value; } };
+    const pageWindow = { scrollY: 0, scrollTo() {} };
+    const result = await probeCaptureWheelScrollContainer(pageWindow, [innerScroller], null,
+      async (deltaY) => { position = Math.max(0, Math.min(1600, position + deltaY)); return true; }, async () => {});
+    return { found: result.scroller === innerScroller, moved: result.moved, restored: position === 900 };
+  })()`, wheelContext);
+  if (!wheelOutcome.found || !wheelOutcome.moved || !wheelOutcome.restored) {
+    throw new Error("wheel probe must identify and restore a non-programmatic inner scroller even when the page starts near its bottom");
+  }
+  const wheelDocumentOutcome = await vm.runInNewContext(`${captureSource}\n(async () => {
+    let position = 0;
+    const documentScroller = { scrollHeight: 40000, clientHeight: 1000,
+      get scrollTop() { return position; }, set scrollTop(value) { position = value; } };
+    const pageWindow = { scrollY: 0, scrollTo() {} };
+    let dispatched = false;
+    const result = await probeCaptureWheelScrollContainer(pageWindow, [], documentScroller,
+      async (deltaY) => { dispatched = true; position += deltaY; return true; }, async () => {});
+    return { dispatched, found: result.scroller === documentScroller, restored: position === 0 };
+  })()`, wheelContext);
+  if (!wheelDocumentOutcome.dispatched || !wheelDocumentOutcome.found || !wheelDocumentOutcome.restored) {
+    throw new Error("wheel probe must run from measured document height even when overflow-style candidate discovery returns no elements");
+  }
+  const omittedScrollerOutcome = await vm.runInNewContext(`${captureSource}\n(async () => {
+    let position = 0;
+    const realChatScroller = { tagName: "DIV", id: "chat-feed", scrollHeight: 5200, clientHeight: 900,
+      get scrollTop() { return position; }, set scrollTop(value) { position = value; } };
+    const documentScroller = { tagName: "HTML", scrollHeight: 900, clientHeight: 900, scrollTop: 0 };
+    const pageDocument = { scrollingElement: documentScroller, documentElement: documentScroller, body: null,
+      querySelectorAll: () => [realChatScroller] };
+    const pageWindow = { scrollY: 0, scrollTo() {} };
+    const result = await probeCaptureWheelScrollContainer(pageWindow, [], documentScroller,
+      async (deltaY) => { position += deltaY; return true; }, async () => {}, pageDocument);
+    return { moved: result.moved, found: result.scroller === realChatScroller, restored: position === 0 };
+  })()`, wheelContext);
+  if (!omittedScrollerOutcome.moved || !omittedScrollerOutcome.found || !omittedScrollerOutcome.restored) {
+    throw new Error("trusted-wheel discovery must include a real ChatGPT scroller omitted by the size/overflow candidate filters");
+  }
+  if (!captureSource.includes("const allLiveScrollers = collectLiveCaptureScrollers(document)") ||
+      !captureSource.includes("...allLiveScrollers")) {
+    throw new Error("full-page capture must wheel-probe the complete live DOM scroller inventory before accepting a one-segment output");
+  }
+  const liveScrollerOutcome = await vm.runInNewContext(`${captureSource}\n(() => {
+    let initial = 0;
+    const scroller = { tagName: "DIV", scrollHeight: 5000, clientHeight: 800,
+      get scrollTop() { return initial; }, set scrollTop(value) { initial = value; } };
+    const documentObject = { scrollingElement: null, documentElement: null, body: null,
+      querySelectorAll: () => [scroller] };
+    const before = new Map([[scroller, 0]]);
+    scroller.scrollTop = 125;
+    return findMovedCaptureScroller(documentObject, before, 1)?.element === scroller;
+  })()`, wheelContext);
+  if (!liveScrollerOutcome) throw new Error("recovery after a stalled scroll must detect an actual scroller omitted from the initial candidate list when its baseline was recorded");
+  const staleScrollOutcome = await vm.runInNewContext(`${captureSource}\n(async () => {
+    const primary = { tagName: "DIV", id: "primary", scrollHeight: 2000, clientHeight: 800, scrollTop: 0,
+      style: {}, getBoundingClientRect() { return { width: 500, height: 700, top: 0, left: 0, right: 500, bottom: 700 }; } };
+    const alreadyScrolled = { tagName: "DIV", id: "old-scroll", scrollHeight: 5000, clientHeight: 800, scrollTop: 1200,
+      style: {}, getBoundingClientRect() { return { width: 500, height: 700, top: 0, left: 0, right: 500, bottom: 700 }; } };
+    const docScroller = { tagName: "HTML", scrollHeight: 800, clientHeight: 800, scrollTop: 0 };
+    const doc = { scrollingElement: docScroller, documentElement: docScroller, body: null, querySelectorAll: () => [primary, alreadyScrolled] };
+    const win = { scrollY: 0, scrollTo() {} };
+    const result = await probeCaptureWheelScrollContainer(win, [primary], docScroller, async () => true, async () => {}, doc);
+    return { moved: result.moved, scroller: result.scroller, preserved: alreadyScrolled.scrollTop === 1200 };
+  })()`, wheelContext);
+  if (staleScrollOutcome.moved || staleScrollOutcome.scroller || !staleScrollOutcome.preserved) {
+    throw new Error("wheel preflight must ignore an unmeasured scroller's existing scrollTop instead of falsely selecting and resetting it");
+  }
+  if (!captureSource.includes("const range = el.scrollHeight - el.clientHeight") ||
+      captureSource.includes("if (!/(auto|scroll|overlay|hidden)/.test(style.overflowY)) continue;")) {
+    throw new Error("scroll candidates must not be discarded solely because the SPA shell uses nonstandard overflow styling");
+  }
+  const probeContext = { chrome: { runtime: { onMessage: { addListener() {} } } } };
+  const probeOutcomes = await vm.runInNewContext(`${captureSource}\n
+    (async () => {
+      const waitFrame = async () => {};
+      let position = 0;
+      const working = { scrollHeight: 900, clientHeight: 800, style: { scrollBehavior: "smooth" }, get scrollTop() { return position; }, set scrollTop(value) { position = value; } };
+      const moved = await probeCaptureScrollContainer(working, waitFrame);
+      const restored = position === 0 && working.style.scrollBehavior === "smooth";
+      let stuckPosition = 0;
+      const stuck = { scrollHeight: 900, clientHeight: 800, style: {}, get scrollTop() { return stuckPosition; }, set scrollTop(_value) {} };
+      const rejected = !(await probeCaptureScrollContainer(stuck, waitFrame));
+      let windowPosition = 0;
+      const workingWindow = { get scrollY() { return windowPosition; }, scrollTo(_x, y) { windowPosition = y; } };
+      const windowMoved = await probeCaptureWindowScroll(workingWindow, 900, waitFrame);
+      const windowRestored = windowPosition === 0;
+      const blockedWindow = { scrollY: 0, scrollTo() {} };
+      const windowRejected = !(await probeCaptureWindowScroll(blockedWindow, 900, waitFrame));
+      let innerPosition = 0;
+      const inner = { scrollHeight: 6000, clientHeight: 800, style: {}, get scrollTop() { return innerPosition; }, set scrollTop(value) { innerPosition = value; } };
+      let deadPosition = 0;
+      const deadWrapper = { scrollHeight: 6100, clientHeight: 800, style: {}, get scrollTop() { return deadPosition; }, set scrollTop(_value) {} };
+      const selected = await selectCaptureScrollContainer(blockedWindow, 5300,
+        [{element:deadWrapper, range:5300, score:1000}, {element:inner, range:5200, score:900}], null, null, waitFrame);
+      let nearBottomPosition = 850;
+      const nearBottomWindow = { get scrollY() { return nearBottomPosition; }, scrollTo(_x, y) { nearBottomPosition = y; } };
+      const nearBottomMoved = await probeCaptureWindowScroll(nearBottomWindow, 900, waitFrame);
+      return { moved, restored, rejected, windowMoved, windowRestored, windowRejected,
+        selectedInner: selected === inner, innerRestored: innerPosition === 0, nearBottomMoved, nearBottomRestored: nearBottomPosition === 850 };
+    })()
+  `, probeContext);
+  if (!probeOutcomes.moved || !probeOutcomes.restored || !probeOutcomes.rejected ||
+      !probeOutcomes.windowMoved || !probeOutcomes.windowRestored || !probeOutcomes.windowRejected ||
+      !probeOutcomes.selectedInner || !probeOutcomes.innerRestored || !probeOutcomes.nearBottomMoved || !probeOutcomes.nearBottomRestored) {
+    throw new Error("scroll selection must find the real inner scroller when ranges are similar, restore probes, and work from a page-tail starting position");
   }
   const clampContext = { chrome: { runtime: { onMessage: { addListener() {} } } } };
   const tail31 = vm.runInNewContext(`${captureSource}\nevaluateCaptureScrollClamp(4003, 3972, 3972, 24)`, clampContext);
@@ -204,7 +412,7 @@ for (const name of ["popup.html", "popup.js", "popup.css", "README.md", "VALIDAT
   if (midPageStall.reachedBottom) throw new Error("a mid-page position mismatch must not be accepted as a tail clamp");
   const oversizedTailChange = vm.runInNewContext(`${captureSource}\nevaluateCaptureScrollClamp(4004, 3939, 3939, 24)`, clampContext);
   if (!oversizedTailChange.overrun) throw new Error("tail changes greater than 64 px must still fail closed");
-  if (!captureSource.includes("function getNextCaptureTarget") || !captureSource.includes("getNextCaptureTarget(outputCoveredCss, viewportHeight, captureStepStride, i === 1)")) {
+  if (!captureSource.includes("function getNextCaptureTarget") || !captureSource.includes("getNextCaptureTarget(outputCoveredCss, captureViewportHeight, captureStepStride, i === 1)")) {
     throw new Error("capture tiles must be aligned to the actually covered frontier");
   }
   const frontierTest = vm.runInNewContext(`${captureSource}\n(() => { let covered=0, y=0; const positions=[]; for (let i=0;i<10;i++) { y=i===0?0:getNextCaptureTarget(covered,1000,180,i===1); const actual=y-(i===4?28:0); const top=i===0?0:covered-actual; const draw=i===0?820:1000-top; positions.push({y,actual,top}); covered+=draw; } return {positions,covered}; })()`, clampContext);
@@ -247,8 +455,23 @@ for (const name of ["popup.html", "popup.js", "popup.css", "README.md", "VALIDAT
     const keepAlive = messageListener(message, { tab: { id: 1, windowId: 1 } }, resolve);
     if (!keepAlive) reject(new Error(`${message.type} channel did not stay open`));
   });
+  const logWrite = await sendBackgroundMessage({ type: "full-page-capture-progress", jobId: "diagnostic-job", diagnostic: { event: "test-event" } });
+  if (!logWrite?.ok) throw new Error("full capture diagnostic event was not persisted");
+  const logRead = await sendBackgroundMessage({ type: "get-full-page-capture-log" });
+  if (!logRead?.ok || logRead.log?.jobId !== "diagnostic-job" || logRead.log.entries.at(-1)?.event !== "test-event") {
+    throw new Error("persisted full capture diagnostic log could not be retrieved after popup close");
+  }
   const beginCapture = await sendBackgroundMessage({ type: "begin-full-page-capture-session", jobId: "capture-job" });
   if (!beginCapture?.ok || backgroundContext.debuggerAttach?.target?.tabId !== 1) throw new Error("background capture debugger attach failed");
+  backgroundContext.chrome.tabs.zoom = 0.75;
+  const zoomBegin = await sendBackgroundMessage({ type: "begin-full-page-capture-session", jobId: "zoom-job" });
+  if (!zoomBegin?.ok || !zoomBegin.zoomAdjusted || backgroundContext.chrome.tabs.zoom !== 1) {
+    throw new Error("low-zoom capture must temporarily use 100% for text sharpness");
+  }
+  const zoomEnd = await sendBackgroundMessage({ type: "end-full-page-capture-session", jobId: "zoom-job" });
+  if (!zoomEnd?.ok || backgroundContext.chrome.tabs.zoom !== 0.75) {
+    throw new Error("capture must restore the user's original browser zoom");
+  }
   const captureReply = await new Promise((resolve, reject) => {
     const keepAlive = messageListener({ type: "capture-full-page-segment", jobId: "capture-job", options: { format: "png" } }, { tab: { id: 1, windowId: 1 } }, resolve);
     if (!keepAlive) reject(new Error("segment capture message channel did not stay open"));
@@ -257,6 +480,11 @@ for (const name of ["popup.html", "popup.js", "popup.css", "README.md", "VALIDAT
     throw new Error("inactive-tab CDP screenshot segment integration failed");
   }
   if (!backgroundContext.debuggerCommands.some((item) => item.method === "Page.captureScreenshot" && item.params.captureBeyondViewport === false)) throw new Error("CDP screenshot command was not issued");
+  const wheelReply = await sendBackgroundMessage({ type: "scroll-capture-by-wheel", jobId: "capture-job", x: 640, y: 400, deltaY: 125 });
+  const wheelCommand = backgroundContext.debuggerCommands.find((item) => item.method === "Input.dispatchMouseEvent");
+  if (!wheelReply?.ok || wheelCommand?.params?.type !== "mouseWheel" || wheelCommand.params.deltaY !== 125 || wheelCommand.params.x !== 640) {
+    throw new Error("direct-scroll failure fallback must dispatch the requested CDP wheel input to the source tab");
+  }
   const tailReply = await sendBackgroundMessage({ type: "capture-full-page-segment", jobId: "capture-job", options: { format: "png", clip: { x: 0, y: 1000, width: 800, height: 6, scale: 1 } } });
   if (!tailReply?.ok || !backgroundContext.debuggerCommands.some((item) => item.method === "Page.captureScreenshot" && item.params.captureBeyondViewport === true && item.params.clip?.y === 1000)) {
     throw new Error("sub-viewport page-tail capture was not requested through CDP");
@@ -289,10 +517,20 @@ for (const name of ["popup.html", "popup.js", "popup.css", "README.md", "VALIDAT
   if (!downloadReply?.ok || downloadReply.downloadId !== 1 || backgroundContext.downloadRequests.at(-1)?.url !== payload) {
     throw new Error("automatic background image download integration failed");
   }
-  if (captureSource.includes("el.style.setProperty('visibility', 'hidden'") || captureSource.includes('pos === "sticky"')) {
+  if (!captureSource.includes('const segmentCaptureOptions = { format: "png" }') ||
+    !captureSource.includes('segmentFormat: "png-lossless"') ||
+    !captureSource.includes('event: "capture-zoom"') ||
+    !captureSource.includes('if (zoomAdjustedForCapture) await sleep(220)') ||
+    !popupSource.includes('quality: uiFormat === "jpg" ? 96 : undefined,')) {
+  throw new Error("full-page capture tiles must stay lossless and final JPG quality must be high");
+}
+if (captureSource.includes('captureSegmentWithRetry(jobId, windowId, captureOptions, `第 ${i + 1} 段`)')) {
+  throw new Error("full-page tiles must not be compressed as JPG before stitching");
+}
+if (captureSource.includes("el.style.setProperty('visibility', 'hidden'") || captureSource.includes('pos === "sticky"')) {
     throw new Error("full-page capture must not hide page content based on element positioning");
   }
-  console.log("Smoke tests passed: v2.5.15 serialized visible-capture quota and retry policy, v2.5.14 exact 4099/4068/4800/732 tail overlap regression, live-tail shrink recovery, coverage-frontier alignment, downloads, clipping, OneNote, and existing features");
+  console.log("Smoke tests passed: v2.5.35 temporarily normalizes low zoom, restores user zoom, preserves ChatGPT rail, and retains full capture features");
 })().catch((error) => {
   console.error(error);
   process.exitCode = 1;

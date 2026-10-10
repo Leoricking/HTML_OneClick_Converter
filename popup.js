@@ -220,6 +220,40 @@ chrome.runtime.onMessage.addListener((message) => {
   if (message.progress) setProgress(message.progress.done, message.progress.total, message.progress.message);
   if (message.status) setStatus(message.status, message.statusType || "");
 });
+$("copy-capture-log").addEventListener("click", async () => {
+  const output = $("capture-log-output");
+  try {
+    const response = await chrome.runtime.sendMessage({ type: "get-full-page-capture-log" });
+    if (!response?.ok) throw new Error(response?.message || "背景程序無法讀取診斷記錄。");
+    const fullPageCaptureLog = response.log;
+    if (!fullPageCaptureLog?.entries?.length) {
+      setStatus("目前沒有完整頁面截圖 Log。請先執行一次「擷取完整網頁」。", "error");
+      return;
+    }
+    const report = {
+      product: "HTML 一鍵轉換器／網頁剪藏",
+      extensionVersion: chrome.runtime.getManifest().version,
+      logJobId: fullPageCaptureLog.jobId,
+      logUpdatedAt: fullPageCaptureLog.updatedAt,
+      note: "僅包含頁面網址路徑、捲動容器尺寸/位置、截圖拼接與下載診斷；不包含網頁文字或截圖影像。",
+      events: fullPageCaptureLog.entries
+    };
+    output.value = JSON.stringify(report, null, 2);
+    output.classList.remove("hidden");
+    output.scrollTop = output.scrollHeight;
+    try {
+      await navigator.clipboard.writeText(output.value);
+      setStatus("完整 Log 已複製。你可以直接貼回這裡；Log 不含網頁內文或圖片。", "ok");
+    } catch {
+      output.focus();
+      output.select();
+      const copied = document.execCommand("copy");
+      setStatus(copied ? "完整 Log 已複製。" : "Log 已顯示在下方；請點文字框後按 Ctrl+A、Ctrl+C。", copied ? "ok" : "error");
+    }
+  } catch (error) {
+    setStatus(`讀取完整 Log 失敗：${error?.message || error}`, "error");
+  }
+});
 function safeFilename(value, fallback = "webpage") {
   const cleaned = String(value || "")
     .replace(/[<>:"/\\|?*\u0000-\u001F]/g, "_")
@@ -241,7 +275,7 @@ function getImageOptions() {
     captureFormat: uiFormat === "jpg" ? "jpeg" : "png",
     extension: uiFormat,
     mimeType: uiFormat === "jpg" ? "image/jpeg" : "image/png",
-    quality: uiFormat === "jpg" ? 92 : undefined,
+    quality: uiFormat === "jpg" ? 96 : undefined,
     label: uiFormat.toUpperCase()
   };
 }
