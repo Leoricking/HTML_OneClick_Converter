@@ -1,6 +1,77 @@
 importScripts("onenote.js");
 
 const pendingFullPageDownloads = new Map();
+const fullPageDebuggerSessions = new Map();
+const visibleCaptureQueues = new Map();
+const visibleCaptureStartedAt = new Map();
+const VISIBLE_CAPTURE_MIN_INTERVAL_MS = 600;
+
+function debuggerCommand(target, method, params = {}) {
+  return chrome.debugger.sendCommand(target, method, params);
+}
+
+async function beginFullPageDebuggerSession(tabId, windowId, jobId) {
+  if (!Number.isInteger(tabId) || !jobId) throw new Error("完整頁面截圖工作資訊不完整。");
+  if (fullPageDebuggerSessions.has(jobId)) return { ok: true };
+  const target = { tabId };
+  let attached = false;
+  try {
+    await chrome.debugger.attach(target, "1.3");
+    attached = true;
+    await debuggerCommand(target, "Page.enable");
+  } catch (error) {
+    if (attached) {
+      try { await chrome.debugger.detach(target); } catch {}
+    }
+    // Some Chromium builds/pages reject debugger attachment. Keep the job
+    // usable by falling back to captureVisibleTab; segment requests will wait
+    // for the source tab to become active instead of accidentally capturing a
+    // different tab or cancelling the whole job.
+    const reason = error?.message || String(error);
+    fullPageDebuggerSessions.set(jobId, { tabId, windowId, target, mode: "visible", fallbackReason: reason });
+    return { ok: true, mode: "visible", warning: reason };
+  }
+  fullPageDebuggerSessions.set(jobId, { tabId, windowId, target, mode: "debugger" });
+  return { ok: true, mode: "debugger" };
+}
+
+async function endFullPageDebuggerSession(jobId, tabId) {
+  const session = fullPageDebuggerSessions.get(jobId);
+  if (!session || (Number.isInteger(tabId) && session.tabId !== tabId)) return { ok: true };
+  fullPageDebuggerSessions.delete(jobId);
+  try { if (session.mode === "debugger") await chrome.debugger.detach(session.target); } catch (error) {
+    console.warn("Could not detach screenshot debugger session:", error);
+  }
+  return { ok: true };
+}
+
+chrome.debugger.onDetach.addListener((source) => {
+  for (const [jobId, session] of fullPageDebuggerSessions) {
+    if (session.tabId === source.tabId && session.mode === "debugger") {
+      session.mode = "visible";
+      session.fallbackReason = "背景截圖連線已中斷";
+    }
+  }
+});
+
+async function captureTabViewport(tabId, options, jobId) {
+  const session = fullPageDebuggerSessions.get(jobId);
+  if (!session || session.tabId !== tabId) throw new Error("來源分頁的背景截圖工作已中斷，請重新開始。");
+  if (session.mode === "visible") {
+    const [activeTab] = await chrome.tabs.query({ active: true, windowId: session.windowId });
+    if (activeTab?.id !== tabId) throw new Error("[CAPTURE_WAITING_FOR_SOURCE_TAB] 請切回原網頁；截圖會在原分頁回到前景後自動續跑。");
+    const dataUrl = await captureVisibleTabCompat(session.windowId, { format: options?.format === "jpeg" ? "jpeg" : "png", ...(options?.format === "jpeg" && Number.isFinite(options?.quality) ? { quality: options.quality } : {}) });
+    return { dataUrl, mode: "visible" };
+  }
+  const format = options?.format === "jpeg" ? "jpeg" : "png";
+  const clip = options?.clip && typeof options.clip === "object" ? options.clip : null;
+  const params = { format, fromSurface: true, captureBeyondViewport: Boolean(clip) };
+  if (clip) params.clip = clip;
+  if (format === "jpeg" && Number.isFinite(options?.quality)) params.quality = options.quality;
+  const result = await debuggerCommand(session.target, "Page.captureScreenshot", params);
+  if (typeof result?.data !== "string" || !result.data) throw new Error("瀏覽器沒有回傳來源分頁截圖資料。");
+  return { dataUrl: `data:image/${format};base64,${result.data}`, mode: "debugger" };
+}
 
 function safeFilename(value, fallback = "webpage") {
   const cleaned = String(value || "")
@@ -57,6 +128,21 @@ async function downloadBlob(blob, filename) {
 }
 
 function captureVisibleTabCompat(windowId, options) {
+  const previous = visibleCaptureQueues.get(windowId) || Promise.resolve();
+  const capture = previous.catch(() => {}).then(async () => {
+    const lastStarted = visibleCaptureStartedAt.get(windowId);
+    if (Number.isFinite(lastStarted)) {
+      const waitMs = VISIBLE_CAPTURE_MIN_INTERVAL_MS - (Date.now() - lastStarted);
+      if (waitMs > 0) await new Promise((resolve) => setTimeout(resolve, waitMs));
+    }
+    visibleCaptureStartedAt.set(windowId, Date.now());
+    return captureVisibleTabOnce(windowId, options);
+  });
+  visibleCaptureQueues.set(windowId, capture.catch(() => {}));
+  return capture;
+}
+
+function captureVisibleTabOnce(windowId, options) {
   return new Promise((resolve, reject) => {
     let settled = false;
     const finish = (callback, value) => {
@@ -175,17 +261,23 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     }).catch(() => {});
     return false;
   }
-  if (!["clip-selected-html", "clip-selected-region", "capture-full-page-segment",
+  if (!["clip-selected-html", "clip-selected-region", "begin-full-page-capture-session", "end-full-page-capture-session", "capture-full-page-segment",
     "begin-full-page-download", "append-full-page-download", "finish-full-page-download", "abort-full-page-download"].includes(message.type)) return false;
   (async () => {
     if (message.type === "clip-selected-html") return saveSelectedHtml(message);
     if (message.type === "clip-selected-region") return saveSelectedRegion(message, sender);
+    if (message.type === "begin-full-page-capture-session") {
+      if (!sender.tab?.id) throw new Error("找不到來源分頁，無法啟用背景截圖。");
+      if (!Number.isInteger(sender.tab.windowId)) throw new Error("找不到來源分頁視窗，無法啟用截圖。");
+      return beginFullPageDebuggerSession(sender.tab.id, sender.tab.windowId, message.jobId);
+    }
+    if (message.type === "end-full-page-capture-session") {
+      return endFullPageDebuggerSession(message.jobId, sender.tab?.id);
+    }
     if (message.type === "capture-full-page-segment") {
       if (!sender.tab?.id || !Number.isInteger(sender.tab.windowId)) throw new Error("找不到完整頁面截圖的來源分頁。");
-      const [activeTab] = await chrome.tabs.query({ active: true, windowId: sender.tab.windowId });
-      if (activeTab?.id !== sender.tab.id) throw new Error("請保持原網頁為目前分頁，截圖完成前不要切換分頁。");
-      const dataUrl = await captureVisibleTabCompat(sender.tab.windowId, message.options || { format: "png" });
-      return { ok: true, dataUrl };
+      const captured = await captureTabViewport(sender.tab.id, message.options || { format: "png" }, message.jobId);
+      return { ok: true, ...captured };
     }
     if (message.type === "begin-full-page-download") {
       if (!sender.tab?.id || !message.jobId || typeof message.filename !== "string") throw new Error("長圖下載工作資訊不完整。");

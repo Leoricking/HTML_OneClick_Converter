@@ -176,6 +176,7 @@ button small { display: block; margin-top: 2px; opacity: .72; font-size: 11px; }
 .status { min-height: 20px; margin-top: 0; padding: 5px 0; font-size: 12px; overflow-wrap: anywhere; }
 .status.ok { color: var(--ok); }
 .status.error { color: var(--error); }
+.status.warning { color: #9a5b00; }
 .hidden { display: none; }
 @media (prefers-color-scheme: dark) {
   :root {

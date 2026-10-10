@@ -1,5 +1,36 @@
 Validation report
 =================
+- v2.5.15 regression test serializes concurrent captureVisibleTab fallback requests at >=550 ms intervals
+- v2.5.15 retries Chromium MAX_CAPTURE_VISIBLE_TAB_CALLS_PER_SECOND errors with longer backoff
+- v2.5.14 regression test reproduces the reported 4099 px max / 4068 px actual / 4800 px covered / 732 px viewport and skips only the empty final overlap
+- v2.5.14 refuses to trim or skip if the 31 px tail is not already covered
+- v2.5.13 regression test clamps stale final target 4580 px to the live maximum 4099 px
+- v2.5.13 trims a contracted page only after the live bottom is reached and the new full height is covered; rejects incomplete coverage
+- v2.5.13 stops planned tile iteration after the live page bottom is fully covered
+- v2.5.12 regression test realigns each screenshot tile from the actual covered frontier so scroll offsets do not accumulate across later segments
+- v2.5.12 final tile targets the live page tail and discontinuity errors include requested/actual positions, covered height, and viewport height
+- v2.5.11 regression test accepts the 104-page 4096 px target / 4068 px actual position when scrolling advanced and settled within 64 px
+- v2.5.11 regression test rejects a repeated viewport without forward movement and rejects discrepancies greater than 64 px
+- v2.5.10 accepts the reported 4003 px target / 3972 px settled position when the live end-of-page request is bounded within 64 px, including a stale browser-reported maximum
+- v2.5.10 regression tests retain rejection of mid-page stalls and tail discrepancies greater than 64 px
+- v2.5.7 falls back when debugger attachment is rejected; it waits for the original tab and resumes instead of capturing another tab or aborting
+- v2.5.7 shortens static-page segment settling to 110 ms and other pages to 260 ms while retaining overlap and coverage checks
+- v2.5.9 tail clamp uses live scroll maximum and actual position, independent of the preflight's planned final tile
+- v2.5.9 regression test accepts requested 4003 px with a live maximum of 3972 px (31 px tail clamp)
+- v2.5.9 mid-page position mismatch and tail changes greater than 64 px remain rejected
+- v2.5.9 trims only a matching, uncovered document-height tail without scaling already captured pixels
+- v2.5.7 falls back when debugger attachment is rejected; it waits for the original tab and resumes instead of capturing another tab or aborting
+- v2.5.7 shortens static-page segment settling to 110 ms and other pages to 260 ms while retaining overlap and coverage checks
+- v2.5.6 captures the source tab through a temporary debugger session when the browser permits it
+- v2.5.6 detaches the debugger session in the content-script cleanup path
+- v2.5.6 ignores sticky attribute-only mutations in static-page probing but keeps text/node mutation fallback
+- v2.5.6 accepts final bottom clamping within 24 px; unresolved inner-scroller gaps still fail closed
+- v2.5.6 uses instant scroll positioning with position verification instead of smooth animation for every tile
+- v2.5.5 static-page fast path requires a reversible DOM-mutation probe and excludes Garmin, tables, grids, canvas, and nested scrollers
+- v2.5.5 fast path uses a 70% viewport stride with overlap; uncertain pages retain the v2.5.4 conservative stride
+- v2.5.5 first fast-path tile covers the full viewport to prevent gaps at larger strides
+- v2.5.4 accepts small bottom scroll clamping and stitches using the actual scroll position
+- v2.5.4 reduces fixed per-segment wait from 650 ms to 350 ms while retaining the narrow overlap stride
 - v2.5.3 long captures pace screenshot requests and retry transient segment capture failures up to six attempts
 - v2.5.3 completed canvas parts are encoded and released during capture to bound peak raw-canvas memory
 - v2.5.3 retry progress is reported beside the full-page capture action
