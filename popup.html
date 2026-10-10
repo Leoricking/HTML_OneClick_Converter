@@ -135,6 +135,14 @@
         <span>擷取完整網頁</span>
         <small>自動捲動並拼接成整頁長圖（PNG / JPG）</small>
       </button>
+
+      <div class="capture-feedback" aria-label="完整頁面下載狀態">
+        <div id="progress" class="progress hidden">
+          <div class="progress-track"><div id="progress-bar"></div></div>
+          <span id="progress-text">處理中…</span>
+        </div>
+        <div id="status" class="status" role="status" aria-live="polite"></div>
+      </div>
     </section>
 
     <section class="group">
@@ -170,11 +178,6 @@
       <span>TXT 加入標題、網址與擷取時間</span>
     </label>
 
-    <div id="progress" class="progress hidden">
-      <div class="progress-track"><div id="progress-bar"></div></div>
-      <span id="progress-text">處理中…</span>
-    </div>
-    <div id="status" class="status" role="status" aria-live="polite"></div>
   </main>
   <script src="onenote.js"></script>
   <script src="popup.js"></script>

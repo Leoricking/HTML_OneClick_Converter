@@ -1,5 +1,12 @@
 Validation report
 =================
+- v2.5.3 long captures pace screenshot requests and retry transient segment capture failures up to six attempts
+- v2.5.3 completed canvas parts are encoded and released during capture to bound peak raw-canvas memory
+- v2.5.3 retry progress is reported beside the full-page capture action
+- v2.5.2 oversized full-page canvases are split into numbered, original-scale vertical image downloads
+- v2.5.2 capture progress and errors are visibly grouped directly below the full-page capture button
+- v2.5.1 shows capture progress/status directly below screenshot controls
+- v2.5.1 reports tab query, content-script injection, and capture-start failures with timeouts
 - v2.5.0 captures full-page screenshots in small scroll steps and writes only contiguous uncovered strips
 - v2.5.0 checks final stitched coverage and cancels the download if any page-height region is missing
 - v2.4.9 never hides page elements during full-page screenshot stitching, preventing positioned/virtualized rows from disappearing

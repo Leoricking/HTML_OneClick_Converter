@@ -44,7 +44,7 @@
     };
     let activeScroller = null;
     let scrollerOriginal = null;
-    let canvas = null;
+    let canvases = [];
     let persistentSidePanelRegions = [];
     try {
       sendProgress(jobId, { done: 0, total: 1, message: "分析頁面尺寸…" }, `正在準備完整網頁截圖（${imageOptions.label}）…`);
@@ -100,9 +100,13 @@
       const dpr = window.devicePixelRatio || 1;
       const outputWidth = Math.round(width * dpr);
       const outputHeight = Math.round(height * dpr);
-      if (outputWidth > 32767 || outputHeight > 32767 || outputWidth * outputHeight > 268435456) {
-        throw new Error("頁面尺寸過大，超出瀏覽器 Canvas 可輸出的長圖限制。請縮小頁面縮放比例後再試。");
+      if (outputWidth > 32767) {
+        throw new Error(`頁面寬度 ${outputWidth} 像素超出瀏覽器單張圖片上限；請縮小瀏覽器縮放比例後重試。`);
       }
+      const maxCanvasHeight = Math.min(16384, 32767, Math.floor(268435456 / outputWidth));
+      const partCssHeight = Math.max(1, Math.floor(maxCanvasHeight / dpr));
+      const partCount = Math.ceil(height / partCssHeight);
+      if (partCount > 100) throw new Error(`頁面長度需要拆成 ${partCount} 張，超出安全下載數量。請改用「另存 PDF」。`);
 
       const steps = [];
       for (let y = 0; y < scrollRange; y += captureStepStride) steps.push(y);
@@ -178,18 +182,71 @@
       const isRelatedToPersistentSidePanel = (el) => persistentSidePanelRoots.some((rootEl) =>
         rootEl === el || rootEl.contains(el) || el.contains(rootEl)
       );
-      canvas = document.createElement("canvas");
-      canvas.width = outputWidth;
-      canvas.height = outputHeight;
-      const ctx = canvas.getContext("2d", { alpha: false });
-      if (!ctx) throw new Error("無法建立截圖拼接畫布。");
-      ctx.fillStyle = "#ffffff";
-      ctx.fillRect(0, 0, outputWidth, outputHeight);
       const outputScaleX = outputWidth / Math.max(1, viewportWidth);
-      for (const panel of persistentSidePanelRegions) {
-        ctx.fillStyle = panel.backgroundColor;
-        ctx.fillRect(panel.left * outputScaleX, 0, (panel.right - panel.left) * outputScaleX, outputHeight);
+      for (let partIndex = 0; partIndex < partCount; partIndex++) {
+        const startCss = partIndex * partCssHeight;
+        const heightCss = Math.min(partCssHeight, height - startCss);
+        canvases.push({ canvas: null, ctx: null, mainBlob: null, startCss, heightCss });
       }
+      const ensurePartCanvas = (part) => {
+        if (part.canvas) return;
+        const canvas = document.createElement("canvas");
+        canvas.width = outputWidth;
+        canvas.height = Math.max(1, Math.round(part.heightCss * dpr));
+        const ctx = canvas.getContext("2d", { alpha: false });
+        if (!ctx) throw new Error("無法建立截圖拼接畫布。");
+        ctx.fillStyle = "#ffffff";
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        for (const panel of persistentSidePanelRegions) {
+          ctx.fillStyle = panel.backgroundColor;
+          ctx.fillRect(panel.left * outputScaleX, 0, (panel.right - panel.left) * outputScaleX, canvas.height);
+        }
+        part.canvas = canvas;
+        part.ctx = ctx;
+      };
+      const drawAcrossParts = (image, sourceX, sourceY, sourceWidth, sourceHeight, destXCss, destYCss, destWidthCss, destHeightCss, excludePanels = false) => {
+        const destBottomCss = destYCss + destHeightCss;
+        for (const part of canvases) {
+          const overlapTop = Math.max(destYCss, part.startCss);
+          const overlapBottom = Math.min(destBottomCss, part.startCss + part.heightCss);
+          if (overlapBottom <= overlapTop) continue;
+          ensurePartCanvas(part);
+          const sourcePerCss = sourceHeight / Math.max(0.001, destHeightCss);
+          const sourcePartY = sourceY + (overlapTop - destYCss) * sourcePerCss;
+          const sourcePartHeight = (overlapBottom - overlapTop) * sourcePerCss;
+          const destinationY = (overlapTop - part.startCss) * dpr;
+          const destinationHeight = (overlapBottom - overlapTop) * dpr;
+          const destinationX = destXCss * outputScaleX;
+          const destinationWidth = destWidthCss * outputScaleX;
+          if (excludePanels && persistentSidePanelRegions.length) {
+            part.ctx.save();
+            part.ctx.beginPath();
+            part.ctx.rect(0, destinationY, outputWidth, destinationHeight);
+            for (const panel of persistentSidePanelRegions) {
+              part.ctx.rect(panel.left * outputScaleX, destinationY, (panel.right - panel.left) * outputScaleX, destinationHeight);
+            }
+            part.ctx.clip("evenodd");
+          }
+          part.ctx.drawImage(image, sourceX, sourcePartY, sourceWidth, sourcePartHeight,
+            destinationX, destinationY, destinationWidth, destinationHeight);
+          if (excludePanels && persistentSidePanelRegions.length) part.ctx.restore();
+        }
+      };
+
+      const flushCompleteParts = async (coveredCss) => {
+        for (let index = 0; index < canvases.length; index++) {
+          const part = canvases[index];
+          if (part.mainBlob || !part.canvas || part.startCss + part.heightCss > coveredCss + 2) continue;
+          part.mainBlob = await canvasToBlob(part.canvas, imageOptions.mimeType,
+            imageOptions.captureFormat === "jpeg" ? imageOptions.quality / 100 : undefined);
+          part.canvas.width = 1;
+          part.canvas.height = 1;
+          part.canvas = null;
+          part.ctx = null;
+          sendProgress(jobId, { done: index + 1, total: canvases.length, message: `第 ${index + 1} / ${canvases.length} 張已拼接` },
+            `已完成 ${index + 1} / ${canvases.length} 張頁面分段，繼續擷取…`);
+        }
+      };
 
       const setScrollY = (value) => activeScroller ? activeScroller.scrollTo(0, value) : window.scrollTo(0, value);
       const getScrollY = () => activeScroller ? activeScroller.scrollTop : window.scrollY;
@@ -238,16 +295,10 @@
         // which permanently removes real content from the exported image.
         // Repeated fixed UI is preferable to missing page data.
 
-        await sleep(550);
+        await sleep(650);
         const captureOptions = { format: imageOptions.captureFormat };
         if (imageOptions.captureFormat === "jpeg") captureOptions.quality = imageOptions.quality;
-        const captured = await chrome.runtime.sendMessage({
-          type: "capture-full-page-segment",
-          jobId,
-          windowId,
-          options: captureOptions
-        });
-        if (!captured?.ok || !captured.dataUrl) throw new Error(captured?.message || "瀏覽器沒有回傳截圖片段。");
+        const captured = await captureSegmentWithRetry(jobId, windowId, captureOptions, `第 ${i + 1} 段`);
         const image = await loadImage(captured.dataUrl);
         const sourceScaleY = image.height / Math.max(1, viewportHeight);
         const sourceTopCss = i === 0 ? 0 : outputCoveredCss - y;
@@ -262,34 +313,26 @@
         if (drawCssHeight <= 0) { image.close?.(); break; }
         const sourcePixelTop = Math.round(Math.max(0, sourceTopCss) * sourceScaleY);
         const sourcePixelHeight = Math.min(image.height - sourcePixelTop, Math.round(drawCssHeight * sourceScaleY));
-        const destinationY = Math.round(outputCoveredCss * dpr);
         const destinationPixelHeight = Math.round(drawCssHeight * dpr);
         if (sourcePixelHeight <= 0 || destinationPixelHeight <= 0) {
           image.close?.();
           throw new Error(`第 ${i + 1} 段截圖高度無效，已停止以免下載不完整長圖。`);
         }
-        if (persistentSidePanelRegions.length === 0) {
-          ctx.drawImage(image, 0, sourcePixelTop, image.width, sourcePixelHeight, 0, destinationY, outputWidth, destinationPixelHeight);
-        } else {
-          // Keep fixed panels out of page segments. They are captured and
-          // stitched in a separate pass below using their own scroll range.
-          ctx.save();
-          ctx.beginPath();
-          ctx.rect(0, destinationY, outputWidth, destinationPixelHeight);
-          for (const panel of persistentSidePanelRegions) {
-            ctx.rect(panel.left * outputScaleX, destinationY, (panel.right - panel.left) * outputScaleX, destinationPixelHeight);
-          }
-          ctx.clip("evenodd");
-          ctx.drawImage(image, 0, sourcePixelTop, image.width, sourcePixelHeight, 0, destinationY, outputWidth, destinationPixelHeight);
-          ctx.restore();
-        }
+        drawAcrossParts(image, 0, sourcePixelTop, image.width, sourcePixelHeight,
+          0, outputCoveredCss, width, drawCssHeight, true);
         outputCoveredCss += drawCssHeight;
         image.close?.();
+        await flushCompleteParts(outputCoveredCss);
       }
 
       if (outputCoveredCss < height - 2) {
         throw new Error(`長圖只拼接到 ${Math.round(outputCoveredCss)} / ${Math.round(height)} px；已取消下載，請重試。`);
       }
+      await flushCompleteParts(height);
+      for (let index = 0; index < canvases.length; index++) {
+        if (!canvases[index].mainBlob) throw new Error(`第 ${index + 1} 張長圖沒有內容，已停止避免輸出空白圖片。`);
+      }
+      const panelStrips = [];
 
       if (persistentSidePanelRegions.length) {
         const panelPassHeight = Math.max(...persistentSidePanelRegions.map((panel) => panel.contentHeight));
@@ -304,13 +347,10 @@
             if (panel.scroller) panel.scroller.scrollTop = Math.min(panelY, panel.scrollRange);
           }
           if (persistentSidePanelRegions.some((panel) => panel.scroller)) await sleep(200);
-          await sleep(550);
+          await sleep(650);
           const captureOptions = { format: imageOptions.captureFormat };
           if (imageOptions.captureFormat === "jpeg") captureOptions.quality = imageOptions.quality;
-          const captured = await chrome.runtime.sendMessage({
-            type: "capture-full-page-segment", jobId, windowId, options: captureOptions
-          });
-          if (!captured?.ok || !captured.dataUrl) throw new Error(captured?.message || "瀏覽器沒有回傳側欄截圖片段。");
+          const captured = await captureSegmentWithRetry(jobId, windowId, captureOptions, `側欄第 ${index + 1} 段`);
           const image = await loadImage(captured.dataUrl);
           const sourceScaleX = image.width / Math.max(1, viewportWidth);
           const sourceScaleY = image.height / Math.max(1, viewportHeight);
@@ -319,13 +359,21 @@
             const sourceTopCss = panelY - panelScrollTop;
             const drawHeightCss = Math.min(viewportHeight - sourceTopCss, panel.contentHeight - panelY);
             if (drawHeightCss <= 0) continue;
-            ctx.drawImage(
-              image,
+            const stripCanvas = document.createElement("canvas");
+            stripCanvas.width = Math.max(1, Math.round((panel.right - panel.left) * outputScaleX));
+            stripCanvas.height = Math.max(1, Math.round(drawHeightCss * dpr));
+            const stripContext = stripCanvas.getContext("2d", { alpha: false });
+            if (!stripContext) throw new Error("無法建立側欄拼接畫布。");
+            stripContext.fillStyle = panel.backgroundColor;
+            stripContext.fillRect(0, 0, stripCanvas.width, stripCanvas.height);
+            stripContext.drawImage(image,
               panel.left * sourceScaleX, sourceTopCss * sourceScaleY,
               (panel.right - panel.left) * sourceScaleX, drawHeightCss * sourceScaleY,
-              panel.left * outputScaleX, panelY * dpr,
-              (panel.right - panel.left) * outputScaleX, drawHeightCss * dpr
-            );
+              0, 0, stripCanvas.width, stripCanvas.height);
+            const stripBlob = await canvasToBlob(stripCanvas, "image/png");
+            stripCanvas.width = 1;
+            stripCanvas.height = 1;
+            panelStrips.push({ panelIndex: persistentSidePanelRegions.indexOf(panel), y: panelY, heightCss: drawHeightCss, blob: stripBlob });
           }
           image.close?.();
           sendProgress(jobId, { done: index + 1, total: panelSteps.length, message: `側欄第 ${index + 1} / ${panelSteps.length} 段已拼接` },
@@ -333,15 +381,51 @@
         }
       }
 
-      sendProgress(jobId, { done: uniqueSteps.length, total: uniqueSteps.length, message: `正在產生 ${imageOptions.label}…` }, "正在產生完整網頁圖片…");
-      const blob = await canvasToBlob(canvas, imageOptions.mimeType,
-        imageOptions.captureFormat === "jpeg" ? imageOptions.quality / 100 : undefined);
-      const filename = `HTML轉圖片/${safeFilename(title)}_${timestamp()}_完整網頁.${imageOptions.extension}`;
-      const dataUrl = await blobToDataUrl(blob);
-      const result = await transferImageForDownload(jobId, filename, dataUrl);
-      if (!result?.ok) throw new Error(result?.message || "完整頁面圖片下載失敗。");
-      sendProgress(jobId, { done: uniqueSteps.length, total: uniqueSteps.length, message: "下載完成" },
-        `完整網頁 ${imageOptions.label} 已自動下載，共拼接 ${uniqueSteps.length} 段。`, "ok");
+      const timestampLabel = timestamp();
+      const downloads = [];
+      for (let partIndex = 0; partIndex < canvases.length; partIndex++) {
+        const part = canvases[partIndex];
+        sendProgress(jobId, { done: partIndex, total: canvases.length, message: `正在產生第 ${partIndex + 1} / ${canvases.length} 張…` },
+          canvases.length > 1 ? `完整頁面較長，將分成 ${canvases.length} 張圖片自動下載…` : "正在產生完整網頁圖片…");
+        const finalCanvas = document.createElement("canvas");
+        finalCanvas.width = outputWidth;
+        finalCanvas.height = Math.max(1, Math.round(part.heightCss * dpr));
+        const finalContext = finalCanvas.getContext("2d", { alpha: false });
+        if (!finalContext) throw new Error(`無法整理第 ${partIndex + 1} 張長圖。`);
+        const mainBitmap = await createImageBitmap(part.mainBlob);
+        finalContext.drawImage(mainBitmap, 0, 0, finalCanvas.width, finalCanvas.height);
+        mainBitmap.close?.();
+        for (const strip of panelStrips) {
+          const panel = persistentSidePanelRegions[strip.panelIndex];
+          if (!panel) continue;
+          const overlapTop = Math.max(strip.y, part.startCss);
+          const overlapBottom = Math.min(strip.y + strip.heightCss, part.startCss + part.heightCss);
+          if (overlapBottom <= overlapTop) continue;
+          const stripBitmap = await createImageBitmap(strip.blob);
+          const sourceScale = stripBitmap.height / strip.heightCss;
+          const sourceY = (overlapTop - strip.y) * sourceScale;
+          const sourceHeight = (overlapBottom - overlapTop) * sourceScale;
+          finalContext.drawImage(stripBitmap, 0, sourceY, stripBitmap.width, sourceHeight,
+            panel.left * outputScaleX, (overlapTop - part.startCss) * dpr,
+            (panel.right - panel.left) * outputScaleX, (overlapBottom - overlapTop) * dpr);
+          stripBitmap.close?.();
+        }
+        const blob = await canvasToBlob(finalCanvas, imageOptions.mimeType,
+          imageOptions.captureFormat === "jpeg" ? imageOptions.quality / 100 : undefined);
+        finalCanvas.width = 1;
+        finalCanvas.height = 1;
+        part.mainBlob = null;
+        const partSuffix = canvases.length > 1 ? `_完整網頁_第${String(partIndex + 1).padStart(3, "0")}部分` : "_完整網頁";
+        const filename = `HTML轉圖片/${safeFilename(title)}_${timestampLabel}${partSuffix}.${imageOptions.extension}`;
+        const dataUrl = await blobToDataUrl(blob);
+        const result = await transferImageForDownload(`${jobId}-${partIndex + 1}`, filename, dataUrl);
+        if (!result?.ok) throw new Error(result?.message || `第 ${partIndex + 1} 張圖片下載失敗。`);
+        downloads.push(result);
+        sendProgress(jobId, { done: partIndex + 1, total: canvases.length, message: `已下載第 ${partIndex + 1} / ${canvases.length} 張` },
+          canvases.length > 1 ? `已下載 ${partIndex + 1} / ${canvases.length} 張完整頁面圖片…` : "正在完成下載…");
+      }
+      sendProgress(jobId, { done: canvases.length, total: canvases.length, message: "下載完成" },
+        `完整網頁 ${imageOptions.label} 已自動下載${canvases.length > 1 ? ` ${canvases.length} 張分段圖片` : ""}，共拼接 ${uniqueSteps.length} 段。`, "ok");
     } finally {
       for (const panel of persistentSidePanelRegions) {
         if (!panel.scroller) continue;
@@ -355,8 +439,33 @@
         activeScroller.scrollTo(scrollerOriginal.x || 0, scrollerOriginal.y || 0);
       }
       window.scrollTo(original.x || 0, original.y || 0);
-      if (canvas) { canvas.width = 1; canvas.height = 1; }
+      for (const part of canvases) {
+        if (part.canvas) { part.canvas.width = 1; part.canvas.height = 1; }
+        part.mainBlob = null;
+      }
     }
+  }
+
+  async function captureSegmentWithRetry(jobId, windowId, options, label) {
+    let lastError = null;
+    const maxAttempts = 6;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        const response = await chrome.runtime.sendMessage({
+          type: "capture-full-page-segment", jobId, windowId, options
+        });
+        if (!response?.ok || !response.dataUrl) throw new Error(response?.message || "瀏覽器沒有回傳截圖片段。");
+        return response;
+      } catch (error) {
+        lastError = error;
+        const reason = error?.message || String(error);
+        if (/請保持原網頁為目前分頁|權限|permission|受保護頁面/i.test(reason) || attempt === maxAttempts) break;
+        const delay = Math.min(5000, 700 * attempt);
+        sendProgress(jobId, null, `${label}暫時無法擷取（${attempt}/${maxAttempts}），${Math.ceil(delay / 1000)} 秒後自動重試…`);
+        await sleep(delay);
+      }
+    }
+    throw new Error(`${label}連續擷取失敗（已自動重試）：${lastError?.message || "瀏覽器未回傳截圖片段。"}`);
   }
 
   function loadImage(src) {

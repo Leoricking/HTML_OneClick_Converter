@@ -6,7 +6,7 @@ const root = path.resolve(__dirname, "..");
 const read = (name) => fs.readFileSync(path.join(root, name), "utf8");
 
 const manifest = JSON.parse(read("manifest.json"));
-if (manifest.version !== "2.4.5") throw new Error("manifest version must be 2.4.2");
+if (manifest.version !== "2.5.3") throw new Error("manifest version must be 2.5.1");
 for (const permission of ["activeTab", "scripting", "downloads", "storage", "pageCapture", "clipboardWrite", "identity"]) {
   if (!manifest.permissions.includes(permission)) throw new Error(`missing permission: ${permission}`);
 }
@@ -20,6 +20,9 @@ const popupSource = read("popup.js");
 const backgroundSource = read("background.js");
 const captureSource = read("capture.js");
 const htmlIds = new Set([...html.matchAll(/\bid="([^"]+)"/g)].map((match) => match[1]));
+if (!(html.indexOf('id="capture-full"') < html.indexOf('id="progress"') && html.indexOf('id="progress"') < html.indexOf('id="save-page-pdf"'))) {
+  throw new Error("full-page capture feedback must appear in the visible image-capture section");
+}
 const referencedIds = new Set([...popupSource.matchAll(/\$\("([^"]+)"\)/g)].map((match) => match[1]));
 for (const id of referencedIds) {
   if (!htmlIds.has(id)) throw new Error(`popup.js references missing HTML id: ${id}`);
@@ -140,11 +143,21 @@ for (const name of ["popup.html", "popup.js", "popup.css", "README.md", "VALIDAT
   if (!popupSource.includes('files: ["capture.js"]') || !popupSource.includes('type: "start-full-page-capture"')) {
     throw new Error("full-page capture is not dispatched to the persistent tab content script");
   }
-  if (captureSource.indexOf("const persistentSidePanelRegions =") > captureSource.indexOf("for (const panel of persistentSidePanelRegions)")) {
-    throw new Error("sidebar regions must be initialized before canvas background rendering");
+  if (!captureSource.includes("async function captureSegmentWithRetry") || !captureSource.includes("const maxAttempts = 6") || !captureSource.includes("await sleep(650)")) {
+    throw new Error("long capture must pace and retry transient screenshot failures instead of stopping on the first one");
+  }
+  if (!captureSource.includes("const flushCompleteParts = async (coveredCss)") || !captureSource.includes("part.canvas = null") || !captureSource.includes("await flushCompleteParts(outputCoveredCss)")) {
+    throw new Error("completed image parts must be encoded and released while the long capture is running");
+  }
+  if (!captureSource.includes("const partCount = Math.ceil(height / partCssHeight)") || !captureSource.includes("drawAcrossParts") || !captureSource.includes('_完整網頁_第${String(partIndex + 1).padStart(3, "0")}部分')) {
+    throw new Error("oversized full-page captures must be split into downloadable image parts");
+  }
+  if (captureSource.includes("超出瀏覽器 Canvas 可輸出的長圖限制")) throw new Error("oversized pages must not be rejected before download");
+  if (!captureSource.includes("let persistentSidePanelRegions = []") || !captureSource.includes("rootEl.contains(el) || el.contains(rootEl)")) {
+    throw new Error("sidebar regions and their ancestor shells must remain available and protected");
   }
   if (captureSource.includes("(panelY + sourceTopCss) * dpr")) throw new Error("sidebar source crop offset must not be added to its destination Y");
-  for (const marker of ["capture-full-page-segment", "begin-full-page-download", "append-full-page-download", "finish-full-page-download", 'behavior: "smooth"', "scrollToAndWait(y)", "overlay|hidden", "網頁沒有捲動到第", "persistentSidePanelRoots", "persistentSidePanelRegions", "isInsidePersistentSidePanel", "scrollCandidates", "panelSteps", "const panelY = panelSteps[index]", "panel.scroller.scrollTop = Math.min(panelY, panel.scrollRange)", "panel.contentHeight - panelY", "panelY * dpr", "panel.originalScrollTop", "!isInsidePersistentSidePanel(el)", 'ctx.clip("evenodd")', "panel.scroller.scrollTop = 0", "finally", "window.scrollTo(original.x"]) {
+  for (const marker of ["capture-full-page-segment", "begin-full-page-download", "append-full-page-download", "finish-full-page-download", 'behavior: "smooth"', "scrollToAndWait(y)", "captureStepStride = Math.max(80, Math.min(180, Math.floor(captureStepHeight * 0.16)))", "outputCoveredCss", "第 ${i + 1} 段截圖高度無效", "長圖只拼接到", "for (let y = 0; y < scrollRange; y += captureStepStride)", "Never hide page elements while capturing", "網頁沒有捲動到第", "persistentSidePanelRoots", "persistentSidePanelRegions", "scrollCandidates", "panelSteps", "const panelY = panelSteps[index]", "panel.scroller.scrollTop = Math.min(panelY, panel.scrollRange)", "panel.contentHeight - panelY", "panel.originalScrollTop", 'ctx.clip("evenodd")', "panel.scroller.scrollTop = 0", "finally", "window.scrollTo(original.x"]) {
     if (!captureSource.includes(marker)) throw new Error(`background-safe capture feature missing: ${marker}`);
   }
   if (!backgroundSource.includes('const captureFormat = "png"') || !backgroundSource.includes('createImagePage(options.oneNoteSectionId, pngBlob')) {
@@ -174,7 +187,10 @@ for (const name of ["popup.html", "popup.js", "popup.css", "README.md", "VALIDAT
   if (!downloadReply?.ok || downloadReply.downloadId !== 1 || backgroundContext.downloadRequests.at(-1)?.url !== payload) {
     throw new Error("automatic background image download integration failed");
   }
-  console.log("Smoke tests passed: v2.4.5 independent sidebar stitching, verified segment scrolling, lossless OneNote PNG, chunked transfer, automatic download, clipping, and OneNote");
+  if (captureSource.includes("el.style.setProperty('visibility', 'hidden'") || captureSource.includes('pos === "sticky"')) {
+    throw new Error("full-page capture must not hide page content based on element positioning");
+  }
+  console.log("Smoke tests passed: v2.5.3 retryable long capture and prominent feedback and oversized-page part downloads, startup API timeouts, narrow non-overwriting tiles, coverage validation, sidebar stitching, OneNote, and downloads");
 })().catch((error) => {
   console.error(error);
   process.exitCode = 1;

@@ -246,7 +246,12 @@ function getImageOptions() {
   };
 }
 async function getActiveTab() {
-  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+  const tabs = await callExtensionApi(
+    (callback) => chrome.tabs.query({ active: true, currentWindow: true }, callback),
+    "讀取目前分頁",
+    10000
+  );
+  const [tab] = tabs || [];
   if (!tab?.id) throw new Error("找不到目前分頁。");
   return tab;
 }
@@ -1192,18 +1197,28 @@ copyOneNoteButton.addEventListener("click", () => run(async () => {
 }));
 
 $("capture-full").addEventListener("click", () => run(async () => {
+  setStatus("正在連接目前網頁…");
   const tab = await getActiveTab();
   await ensurePageAccess(tab);
   const imageOptions = getImageOptions();
   const jobId = crypto.randomUUID();
-  await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ["capture.js"] });
-  const response = await chrome.tabs.sendMessage(tab.id, {
-    type: "start-full-page-capture",
-    jobId,
-    windowId: tab.windowId,
-    title: tab.title,
-    imageOptions
-  });
+  setStatus("正在啟動完整頁面截圖…");
+  await callExtensionApi(
+    (callback) => chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ["capture.js"] }, callback),
+    "載入截圖程式",
+    15000
+  );
+  const response = await callExtensionApi(
+    (callback) => chrome.tabs.sendMessage(tab.id, {
+      type: "start-full-page-capture",
+      jobId,
+      windowId: tab.windowId,
+      title: tab.title,
+      imageOptions
+    }, callback),
+    "啟動完整頁面截圖",
+    15000
+  );
   if (!response?.ok) throw new Error(response?.message || "無法啟動背景完整頁面截圖。");
   setStatus("完整頁面截圖已在網頁背景開始；可關閉此視窗，完成後會自動下載。", "ok");
 }));
