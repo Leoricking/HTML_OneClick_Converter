@@ -6,8 +6,11 @@
 - v2.5.16 checks alternative nested candidates and document.scrollingElement before capture
 Validation report
 =================
-- v2.5.35 low zoom temporarily normalizes to 100% and restores original zoom on success/error
-- v2.5.35 regression test verifies original zoom restore and capture diagnostic
+- v2.5.38 regression: document scroll probe handles smooth !important styles, detects actual document-root movement, restores position and CSS, and avoids requiring debugger-only wheel input after verified movement
+- v2.5.38 retains browser zoom and uses the verified document scroll path when background debugger attachment is unavailable
+- v2.5.36 regression test verifies 175% browser zoom remains unchanged during full-page capture
+- v2.5.36 full-page tiles and intermediate stitched parts remain lossless PNG until final JPG/PNG encoding
+- v2.5.36 regression test rejects intermediate JPEG compression before final output
 - v2.5.35 full-page tiles are captured as lossless PNG; final JPG is encoded once at quality 96
 - v2.5.35 regression test rejects per-tile JPEG compression before stitching
 - v2.5.35 regression test verifies the ChatGPT left rail is included once and output width preserves the original conversation scale
@@ -150,3 +153,6 @@ Validation report
 - v2.5.20 prevents a viewport-only download when a scrollable main-content hit-test path cannot be verified
 - v2.5.21 tests wheel-based source discovery when the measured page is long but overflow-style candidate discovery is empty
 - v2.5.21 rejects viewport-only output when a long document's scroll movement cannot be verified
+- v2.5.37 regression test reproduces the supplied YouTube growth case: max scroll 3072 -> 4744 px while only 3890 px is covered
+- v2.5.37 dynamically expands output height/parts and appends segments from the covered frontier instead of jumping over the new page area
+- v2.5.37 diagnostic log records page-height-expanded events

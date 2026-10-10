@@ -36,6 +36,13 @@ function getPageCaptureTarget(frontierTarget, liveMaxY, isLastSegment) {
   return isLastSegment ? liveMaxY : Math.min(frontierTarget, liveMaxY);
 }
 
+function shouldJumpToCaptureTail(isLastSegment, liveMaxY, outputCoveredCss) {
+  // A planned last tile may jump to the live bottom only when that position
+  // is already inside the captured frontier. Infinite-scroll pages can grow
+  // after the plan was made; jumping to their new bottom would skip a gap.
+  return Boolean(isLastSegment && liveMaxY <= outputCoveredCss + 2);
+}
+
 function getCaptureDocumentHeight(root, body) {
   return Math.max(root.scrollHeight, body?.scrollHeight || 0, root.clientHeight);
 }
@@ -106,15 +113,38 @@ async function probeCaptureScrollContainer(element, waitFrame = () => new Promis
 
 async function probeCaptureWindowScroll(windowObject, maxY, waitFrame = () => new Promise((resolve) => requestAnimationFrame(resolve))) {
   const before = windowObject.scrollY;
+  const documentObject = windowObject.document;
+  const documentScroller = documentObject?.scrollingElement || documentObject?.documentElement || documentObject?.body || null;
+  const beforeDocumentTop = documentScroller?.scrollTop ?? before;
   const target = before + 64 <= maxY ? before + 64 : Math.max(0, before - 64);
   if (Math.abs(target - before) <= 3) return false;
-  windowObject.scrollTo(0, target);
-  await waitFrame();
-  await waitFrame();
-  const moved = Math.abs(windowObject.scrollY - before) > 3;
-  windowObject.scrollTo(0, before);
-  await waitFrame();
-  return moved;
+  const rootStyle = documentObject?.documentElement?.style;
+  const oldBehavior = rootStyle?.getPropertyValue?.("scroll-behavior") ?? rootStyle?.scrollBehavior ?? "";
+  const oldPriority = rootStyle?.getPropertyPriority?.("scroll-behavior") ?? "";
+  try {
+    // Some sites set `scroll-behavior:smooth` (occasionally with !important).
+    // A two-frame probe then sees only the first few animation pixels and
+    // wrongly concludes that the page cannot scroll. Force an instant,
+    // reversible probe on the actual document scroller as well as window.
+    if (rootStyle?.setProperty) rootStyle.setProperty("scroll-behavior", "auto", "important");
+    else if (rootStyle) rootStyle.scrollBehavior = "auto";
+    windowObject.scrollTo(0, target);
+    if (documentScroller) documentScroller.scrollTop = target;
+    await waitFrame();
+    await waitFrame();
+    return Math.abs(windowObject.scrollY - before) > 3 ||
+      Math.abs((documentScroller?.scrollTop ?? beforeDocumentTop) - beforeDocumentTop) > 3;
+  } finally {
+    // Restore while smooth scrolling is still disabled, otherwise restoration
+    // itself can leave the page moving after the probe has completed.
+    windowObject.scrollTo(0, before);
+    if (documentScroller) documentScroller.scrollTop = beforeDocumentTop;
+    if (rootStyle?.setProperty) {
+      if (oldBehavior) rootStyle.setProperty("scroll-behavior", oldBehavior, oldPriority);
+      else rootStyle.removeProperty("scroll-behavior");
+    } else if (rootStyle) rootStyle.scrollBehavior = oldBehavior;
+    await waitFrame();
+  }
 }
 
 async function selectCaptureScrollContainer(windowObject, windowRange, candidates, documentScroller, body,
@@ -282,7 +312,6 @@ function findMovedCaptureScroller(documentObject, beforePositions, direction = 1
     let persistentSidePanelRegions = [];
     let chatGPTHiddenUi = [];
     let debuggerSessionStarted = false;
-    let zoomAdjustedForCapture = false;
     let bottomClampPx = 0;
     let scrollProbeDiagnostics = "尚未執行滾輪驗證";
     let captureScrollInputPoint = null;
@@ -290,17 +319,13 @@ function findMovedCaptureScroller(documentObject, beforePositions, direction = 1
       const debuggerStart = await chrome.runtime.sendMessage({ type: "begin-full-page-capture-session", jobId });
       if (!debuggerStart?.ok) throw new Error(debuggerStart?.message || "無法啟用來源分頁背景截圖。");
       debuggerSessionStarted = true;
-      zoomAdjustedForCapture = debuggerStart.zoomAdjusted === true;
       const backgroundMode = debuggerStart.mode || "debugger";
-      const zoomNotice = debuggerStart.zoomAdjusted
-        ? "為提高小字清晰度，已暫時使用 100% 瀏覽器縮放；完成後會恢復原縮放。"
-        : "";
       const modeNotice = backgroundMode === "visible"
-        ? `瀏覽器不允許背景連接此分頁；截圖會暫停等待原網頁，切回後自動續跑。${zoomNotice}`
-        : `${zoomNotice || `正在準備完整網頁截圖（${imageOptions.label}）…`}`;
+        ? "瀏覽器不允許背景連接此分頁；截圖會暫停等待原網頁，切回後自動續跑。"
+        : `正在準備完整網頁截圖（${imageOptions.label}）…`;
       sendProgress(jobId, { done: 0, total: 1, message: "分析頁面尺寸…" }, modeNotice, backgroundMode === "visible" ? "warning" : "");
       sendProgress(jobId, null, "", "", { event: "capture-zoom", originalZoom: debuggerStart.originalZoom,
-        normalizedTo100: debuggerStart.zoomAdjusted === true, effectiveZoom: debuggerStart.zoomAdjusted ? 1 : debuggerStart.originalZoom });
+        normalizedTo100: false, effectiveZoom: debuggerStart.originalZoom });
       root.style.scrollBehavior = "auto";
       const viewportWidth = window.innerWidth;
       const viewportHeight = window.innerHeight;
@@ -363,8 +388,19 @@ function findMovedCaptureScroller(documentObject, beforePositions, direction = 1
       // element heights. SPA shells such as ChatGPT can report similar ranges
       // for window and the real conversation scroller while only the latter
       // actually moves.
-      activeScroller = await selectCaptureScrollContainer(window, windowRange, scrollCandidates, document.scrollingElement, body);
+      const windowScrollVerified = await probeCaptureWindowScroll(window, windowRange);
+      activeScroller = windowScrollVerified ? null :
+        await selectCaptureScrollContainer(window, windowRange, scrollCandidates, document.scrollingElement, body);
       if (!activeScroller) {
+        if (windowScrollVerified) {
+          // When Opera/Chromium refuses debugger attachment, the background
+          // cannot synthesize a trusted wheel event. A reversible movement of
+          // the real document scroller is sufficient proof for window capture;
+          // requiring CDP wheel proof here incorrectly rejects ordinary pages.
+          scrollProbeDiagnostics = `文件捲動已驗證；window=${Math.round(window.scrollY)}；document=${Math.round(document.scrollingElement?.scrollTop || 0)}；range=${Math.round(windowRange)}`;
+          sendProgress(jobId, null, "", "", { event: "window-scroll-preflight", diagnostic: scrollProbeDiagnostics,
+            window: { scrollY: window.scrollY, range: windowRange }, selectedScroller: null });
+        } else {
         const probeX = Math.min(viewportWidth - 1, Math.max(0, Math.round(viewportWidth * 0.68)));
         const probeY = Math.min(viewportHeight - 1, Math.max(0, Math.round(viewportHeight * 0.45)));
         const pointCandidates = [];
@@ -401,6 +437,7 @@ function findMovedCaptureScroller(documentObject, beforePositions, direction = 1
         sendProgress(jobId, null, "", "", { event: "wheel-preflight", diagnostic: scrollProbeDiagnostics,
           selectedScroller: activeScroller ? describeScroller(activeScroller) : null,
           window: { scrollY: window.scrollY, range: windowRange }, inputPoint: captureScrollInputPoint });
+        }
       }
       // A successful programmatic scrollTop probe is not proof that a SPA
       // actually uses that node. In particular, ChatGPT can contain large
@@ -638,6 +675,41 @@ function findMovedCaptureScroller(documentObject, beforePositions, direction = 1
         part.canvas = canvas;
         part.ctx = ctx;
       };
+      const expandCaptureHeight = (measuredHeight) => {
+        if (!Number.isFinite(measuredHeight) || measuredHeight <= height + 2) return false;
+        const oldHeight = height;
+        height = measuredHeight;
+        let cursor = oldHeight;
+        const lastPart = canvases.at(-1);
+        if (lastPart && Math.abs(lastPart.startCss + lastPart.heightCss - oldHeight) <= 2 && !lastPart.mainBlob) {
+          const expandedPartHeight = Math.min(partCssHeight, height - lastPart.startCss);
+          if (expandedPartHeight > lastPart.heightCss && lastPart.canvas) {
+            const expandedCanvas = document.createElement("canvas");
+            expandedCanvas.width = outputWidth;
+            expandedCanvas.height = Math.max(1, Math.round(expandedPartHeight * dpr));
+            const expandedContext = expandedCanvas.getContext("2d", { alpha: false });
+            if (!expandedContext) throw new Error("無法擴充分段截圖畫布。");
+            expandedContext.fillStyle = "#ffffff";
+            expandedContext.fillRect(0, 0, expandedCanvas.width, expandedCanvas.height);
+            expandedContext.drawImage(lastPart.canvas, 0, 0);
+            lastPart.canvas.width = 1;
+            lastPart.canvas.height = 1;
+            lastPart.canvas = expandedCanvas;
+            lastPart.ctx = expandedContext;
+          }
+          lastPart.heightCss = expandedPartHeight;
+          cursor = lastPart.startCss + expandedPartHeight;
+        }
+        while (cursor < height - 2) {
+          const partHeight = Math.min(partCssHeight, height - cursor);
+          canvases.push({ canvas: null, ctx: null, mainBlob: null, startCss: cursor, heightCss: partHeight });
+          cursor += partHeight;
+          if (canvases.length > 100) throw new Error("動態載入後的頁面過長，超出安全分段下載數量；請改用「另存 PDF」。");
+        }
+        sendProgress(jobId, null, "", "", { event: "page-height-expanded", previousHeight: oldHeight,
+          newHeight: height, parts: canvases.length, outputCoveredCss });
+        return true;
+      };
       const drawAcrossParts = (image, sourceX, sourceY, sourceWidth, sourceHeight, destXCss, destYCss, destWidthCss, destHeightCss, excludePanels = false) => {
         const destBottomCss = destYCss + destHeightCss;
         for (const part of canvases) {
@@ -671,8 +743,9 @@ function findMovedCaptureScroller(documentObject, beforePositions, direction = 1
         for (let index = 0; index < canvases.length; index++) {
           const part = canvases[index];
           if (part.mainBlob || !part.canvas || part.startCss + part.heightCss > coveredCss + 2) continue;
-          part.mainBlob = await canvasToBlob(part.canvas, imageOptions.mimeType,
-            imageOptions.captureFormat === "jpeg" ? imageOptions.quality / 100 : undefined);
+          // Keep the intermediate stitched tile lossless. The selected output
+          // format is applied exactly once after all crops and overlays finish.
+          part.mainBlob = await canvasToBlob(part.canvas, "image/png");
           part.canvas.width = 1;
           part.canvas.height = 1;
           part.canvas = null;
@@ -863,17 +936,26 @@ function findMovedCaptureScroller(documentObject, beforePositions, direction = 1
 
       let outputCoveredCss = 0;
       for (let i = 0; i < uniqueSteps.length; i++) {
+        const liveHeightBeforeScroll = activeScroller
+          ? captureViewportHeight + getMaxScrollY()
+          : getCaptureDocumentHeight(root, body);
+        expandCaptureHeight(liveHeightBeforeScroll);
         const isLastPlannedSegment = i === uniqueSteps.length - 1;
         const frontierTarget = i === 0
           ? 0
           : getNextCaptureTarget(outputCoveredCss, captureViewportHeight, captureStepStride, i === 1);
-        // Keep the preflight segment count as an estimate, but align every
-        // interior capture to the pixels already covered. The last segment
-        // still reaches the live page tail, including a page that expanded.
-        const y = getPageCaptureTarget(frontierTarget, getMaxScrollY(), isLastPlannedSegment);
+        // The final planned tile may reach the live tail only if the newly
+        // measured page has not grown beyond the pixels already covered.
+        const liveMaxBeforeScroll = getMaxScrollY();
+        const y = getPageCaptureTarget(frontierTarget, liveMaxBeforeScroll,
+          shouldJumpToCaptureTail(isLastPlannedSegment, liveMaxBeforeScroll, outputCoveredCss));
         sendProgress(jobId, { done: i, total: uniqueSteps.length, message: `擷取第 ${i + 1} / ${uniqueSteps.length} 段…` },
           `正在擷取完整網頁（${imageOptions.label}）…`);
         const actualY = await scrollToAndWait(y);
+        const liveHeightAfterScroll = activeScroller
+          ? captureViewportHeight + getMaxScrollY()
+          : getCaptureDocumentHeight(root, body);
+        expandCaptureHeight(liveHeightAfterScroll);
         // Never hide page elements while capturing. Position-based filtering
         // can classify virtualized table rows or charts as floating chrome,
         // which permanently removes real content from the exported image.
@@ -933,6 +1015,14 @@ function findMovedCaptureScroller(documentObject, beforePositions, direction = 1
           drawCssHeight, outputCoveredCss, pageHeight: height, dimensions: { width: outputWidth, height: outputHeight } });
         image.close?.();
         await flushCompleteParts(outputCoveredCss);
+        if (i === uniqueSteps.length - 1 && outputCoveredCss < height - 2) {
+          // Infinite-scroll sites can extend after the original last planned
+          // tile. Add another iteration and keep following the covered edge.
+          uniqueSteps.push(null);
+          sendProgress(jobId, { done: i + 1, total: uniqueSteps.length,
+            message: `頁面新增內容，延長擷取至第 ${uniqueSteps.length} 段…` },
+            "偵測到頁面載入更多內容，正在接續擷取…");
+        }
         if (actualY >= getMaxScrollY() - 3 && outputCoveredCss >= captureViewportHeight + getMaxScrollY() - 2) {
           // The live page reached its bottom before the preflight segment
           // estimate. It has been fully covered, so do not revisit the same
@@ -990,8 +1080,7 @@ function findMovedCaptureScroller(documentObject, beforePositions, direction = 1
               croppedContext.drawImage(sourceBitmap, 0, 0, outputWidth, croppedPixelHeight,
                 0, 0, outputWidth, croppedPixelHeight);
               sourceBitmap.close?.();
-              lastPart.mainBlob = await canvasToBlob(croppedCanvas, imageOptions.mimeType,
-                imageOptions.captureFormat === "jpeg" ? imageOptions.quality / 100 : undefined);
+              lastPart.mainBlob = await canvasToBlob(croppedCanvas, "image/png");
               croppedCanvas.width = 1;
               croppedCanvas.height = 1;
             }
@@ -1134,13 +1223,10 @@ function findMovedCaptureScroller(documentObject, beforePositions, direction = 1
       }
       root.style.scrollBehavior = original.behavior || "";
       root.style.overflow = original.overflow || "";
-      // Restore browser zoom before restoring the user's original scroll
-      // coordinates; zoom can reflow the page and change its scroll range.
       if (debuggerSessionStarted) {
         try { await chrome.runtime.sendMessage({ type: "end-full-page-capture-session", jobId }); }
         catch (error) { console.warn("Could not release screenshot session:", error); }
         debuggerSessionStarted = false;
-        if (zoomAdjustedForCapture) await sleep(220);
       }
       for (const panel of persistentSidePanelRegions) {
         if (panel.scroller) panel.scroller.scrollTop = panel.originalScrollTop;

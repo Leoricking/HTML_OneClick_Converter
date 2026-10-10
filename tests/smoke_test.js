@@ -6,7 +6,7 @@ const root = path.resolve(__dirname, "..");
 const read = (name) => fs.readFileSync(path.join(root, name), "utf8");
 
 const manifest = JSON.parse(read("manifest.json"));
-if (manifest.version !== "2.5.35") throw new Error("manifest version must be 2.5.35");
+if (manifest.version !== "2.5.37") throw new Error("manifest version must be 2.5.37");
 for (const permission of ["activeTab", "scripting", "downloads", "storage", "pageCapture", "clipboardWrite", "identity", "debugger"]) {
   if (!manifest.permissions.includes(permission)) throw new Error(`missing permission: ${permission}`);
 }
@@ -421,6 +421,15 @@ for (const name of ["popup.html", "popup.js", "popup.css", "README.md", "VALIDAT
   }
   const staleTailTarget = vm.runInNewContext(`${captureSource}\ngetPageCaptureTarget(4580,4099,true)`, clampContext);
   if (staleTailTarget !== 4099) throw new Error("a stale 4580 px planned endpoint must clamp to the live 4099 px page bottom");
+  const expandingTail = vm.runInNewContext(`${captureSource}\n(() => { const viewport=834, liveMax=4744, totalHeight=liveMax+viewport, stride=133; let covered=3890, count=0, gap=false; while (covered<totalHeight-2 && count<100) { const last=true; const jump=shouldJumpToCaptureTail(last,liveMax,covered); const target=getPageCaptureTarget(getNextCaptureTarget(covered,viewport,stride),liveMax,jump); const sourceTop=covered-target; if (sourceTop < -2 || sourceTop >= viewport) gap=true; const draw=Math.min(viewport-Math.max(0,sourceTop),totalHeight-covered); if (draw<=0) { gap=true; break; } covered+=draw; count++; } return {covered,count,gap,totalHeight}; })()`, clampContext);
+  if (expandingTail.gap || expandingTail.covered < expandingTail.totalHeight - 2 || expandingTail.count < 2) {
+    throw new Error("the supplied YouTube 3890/4744 px case must extend the plan and cover every remaining pixel without a gap");
+  }
+  if (!captureSource.includes("const expandCaptureHeight = (measuredHeight)") ||
+      !captureSource.includes('event: "page-height-expanded"') ||
+      !captureSource.includes("uniqueSteps.push(null)")) {
+    throw new Error("dynamic page growth must expand output capacity and append capture segments");
+  }
   const safeShrink = vm.runInNewContext(`${captureSource}\ncanTrimCaptureTail(5180,4799,4799,4099,4099)`, clampContext);
   if (!safeShrink) throw new Error("a contracted page may be trimmed once its live bottom and all remaining pixels are covered");
   const incompleteShrink = vm.runInNewContext(`${captureSource}\ncanTrimCaptureTail(5180,4799,4700,4099,4099)`, clampContext);
@@ -463,14 +472,14 @@ for (const name of ["popup.html", "popup.js", "popup.css", "README.md", "VALIDAT
   }
   const beginCapture = await sendBackgroundMessage({ type: "begin-full-page-capture-session", jobId: "capture-job" });
   if (!beginCapture?.ok || backgroundContext.debuggerAttach?.target?.tabId !== 1) throw new Error("background capture debugger attach failed");
-  backgroundContext.chrome.tabs.zoom = 0.75;
+  backgroundContext.chrome.tabs.zoom = 1.75;
   const zoomBegin = await sendBackgroundMessage({ type: "begin-full-page-capture-session", jobId: "zoom-job" });
-  if (!zoomBegin?.ok || !zoomBegin.zoomAdjusted || backgroundContext.chrome.tabs.zoom !== 1) {
-    throw new Error("low-zoom capture must temporarily use 100% for text sharpness");
+  if (!zoomBegin?.ok || zoomBegin.zoomAdjusted || backgroundContext.chrome.tabs.zoom !== 1.75) {
+    throw new Error("capture must preserve the user's 175% browser zoom");
   }
   const zoomEnd = await sendBackgroundMessage({ type: "end-full-page-capture-session", jobId: "zoom-job" });
-  if (!zoomEnd?.ok || backgroundContext.chrome.tabs.zoom !== 0.75) {
-    throw new Error("capture must restore the user's original browser zoom");
+  if (!zoomEnd?.ok || backgroundContext.chrome.tabs.zoom !== 1.75) {
+    throw new Error("capture must leave the user's 175% browser zoom unchanged");
   }
   const captureReply = await new Promise((resolve, reject) => {
     const keepAlive = messageListener({ type: "capture-full-page-segment", jobId: "capture-job", options: { format: "png" } }, { tab: { id: 1, windowId: 1 } }, resolve);
@@ -520,9 +529,13 @@ for (const name of ["popup.html", "popup.js", "popup.css", "README.md", "VALIDAT
   if (!captureSource.includes('const segmentCaptureOptions = { format: "png" }') ||
     !captureSource.includes('segmentFormat: "png-lossless"') ||
     !captureSource.includes('event: "capture-zoom"') ||
-    !captureSource.includes('if (zoomAdjustedForCapture) await sleep(220)') ||
+    !captureSource.includes('canvasToBlob(part.canvas, "image/png")') ||
+    !captureSource.includes('canvasToBlob(croppedCanvas, "image/png")') ||
     !popupSource.includes('quality: uiFormat === "jpg" ? 96 : undefined,')) {
-  throw new Error("full-page capture tiles must stay lossless and final JPG quality must be high");
+  throw new Error("full-page capture tiles and intermediate parts must stay lossless until final encoding");
+}
+if (captureSource.includes('canvasToBlob(part.canvas, imageOptions.mimeType') || captureSource.includes('canvasToBlob(croppedCanvas, imageOptions.mimeType')) {
+  throw new Error("intermediate image parts must not be JPEG-compressed before final output");
 }
 if (captureSource.includes('captureSegmentWithRetry(jobId, windowId, captureOptions, `第 ${i + 1} 段`)')) {
   throw new Error("full-page tiles must not be compressed as JPG before stitching");
@@ -530,7 +543,7 @@ if (captureSource.includes('captureSegmentWithRetry(jobId, windowId, captureOpti
 if (captureSource.includes("el.style.setProperty('visibility', 'hidden'") || captureSource.includes('pos === "sticky"')) {
     throw new Error("full-page capture must not hide page content based on element positioning");
   }
-  console.log("Smoke tests passed: v2.5.35 temporarily normalizes low zoom, restores user zoom, preserves ChatGPT rail, and retains full capture features");
+  console.log("Smoke tests passed: v2.5.37 handles infinite-scroll height growth, preserves browser zoom, keeps intermediate stitching lossless, and retains full capture features");
 })().catch((error) => {
   console.error(error);
   process.exitCode = 1;

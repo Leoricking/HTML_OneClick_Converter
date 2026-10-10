@@ -17,21 +17,14 @@ async function beginFullPageDebuggerSession(tabId, windowId, jobId) {
   const target = { tabId };
   let attached = false;
   let originalZoom = null;
-  let zoomAdjusted = false;
   try {
-    // Low browser zoom rasterizes small text at very few physical pixels.
-    // Temporarily capture at 100%, then restore the user's exact zoom.
+    // Record the current zoom for diagnostics, but never alter the user's
+    // browser zoom: the screenshot must preserve the exact visible layout.
     try {
       originalZoom = await chrome.tabs.getZoom(tabId);
-      if (Number.isFinite(originalZoom) && originalZoom > 0 && originalZoom < 0.99) {
-        await chrome.tabs.setZoom(tabId, 1);
-        zoomAdjusted = true;
-        await new Promise((resolve) => setTimeout(resolve, 450));
-      }
     } catch (zoomError) {
       originalZoom = null;
-      zoomAdjusted = false;
-      console.warn("Could not normalize page zoom for capture:", zoomError);
+      console.warn("Could not read page zoom for capture diagnostics:", zoomError);
     }
     await chrome.debugger.attach(target, "1.3");
     attached = true;
@@ -45,11 +38,11 @@ async function beginFullPageDebuggerSession(tabId, windowId, jobId) {
     // for the source tab to become active instead of accidentally capturing a
     // different tab or cancelling the whole job.
     const reason = error?.message || String(error);
-    fullPageDebuggerSessions.set(jobId, { tabId, windowId, target, mode: "visible", fallbackReason: reason, originalZoom, zoomAdjusted });
-    return { ok: true, mode: "visible", warning: reason, originalZoom, zoomAdjusted };
+    fullPageDebuggerSessions.set(jobId, { tabId, windowId, target, mode: "visible", fallbackReason: reason, originalZoom });
+    return { ok: true, mode: "visible", warning: reason, originalZoom, zoomAdjusted: false };
   }
-  fullPageDebuggerSessions.set(jobId, { tabId, windowId, target, mode: "debugger", originalZoom, zoomAdjusted });
-  return { ok: true, mode: "debugger", originalZoom, zoomAdjusted };
+  fullPageDebuggerSessions.set(jobId, { tabId, windowId, target, mode: "debugger", originalZoom });
+  return { ok: true, mode: "debugger", originalZoom, zoomAdjusted: false };
 }
 
 async function endFullPageDebuggerSession(jobId, tabId) {
@@ -58,14 +51,6 @@ async function endFullPageDebuggerSession(jobId, tabId) {
   fullPageDebuggerSessions.delete(jobId);
   try { if (session.mode === "debugger") await chrome.debugger.detach(session.target); } catch (error) {
     console.warn("Could not detach screenshot debugger session:", error);
-  }
-  if (session.zoomAdjusted && Number.isFinite(session.originalZoom)) {
-    try {
-      await chrome.tabs.setZoom(session.tabId, session.originalZoom);
-      await new Promise((resolve) => setTimeout(resolve, 180));
-    } catch (error) {
-      console.warn("Could not restore the original page zoom after capture:", error);
-    }
   }
   return { ok: true };
 }
