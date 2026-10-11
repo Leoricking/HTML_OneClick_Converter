@@ -6,7 +6,7 @@ const root = path.resolve(__dirname, "..");
 const read = (name) => fs.readFileSync(path.join(root, name), "utf8");
 
 const manifest = JSON.parse(read("manifest.json"));
-if (manifest.version !== "2.5.37") throw new Error("manifest version must be 2.5.37");
+if (manifest.version !== "2.5.40") throw new Error("manifest version must be 2.5.40");
 for (const permission of ["activeTab", "scripting", "downloads", "storage", "pageCapture", "clipboardWrite", "identity", "debugger"]) {
   if (!manifest.permissions.includes(permission)) throw new Error(`missing permission: ${permission}`);
 }
@@ -389,6 +389,32 @@ for (const name of ["popup.html", "popup.js", "popup.css", "README.md", "VALIDAT
       !probeOutcomes.selectedInner || !probeOutcomes.innerRestored || !probeOutcomes.nearBottomMoved || !probeOutcomes.nearBottomRestored) {
     throw new Error("scroll selection must find the real inner scroller when ranges are similar, restore probes, and work from a page-tail starting position");
   }
+  const smoothDocumentProbe = await vm.runInNewContext(`${captureSource}\n(async () => {
+    let position = 0;
+    let behavior = "smooth";
+    let priority = "important";
+    const style = {
+      getPropertyValue: () => behavior,
+      getPropertyPriority: () => priority,
+      setProperty: (_name, value, nextPriority) => { behavior = value; priority = nextPriority; },
+      removeProperty: () => { behavior = ""; priority = ""; }
+    };
+    const root = { style, scrollHeight: 4704, clientHeight: 732,
+      get scrollTop() { return position; }, set scrollTop(value) { if (behavior === "auto") position = value; } };
+    const documentObject = { scrollingElement: root, documentElement: root };
+    const pageWindow = { document: documentObject, get scrollY() { return position; },
+      scrollTo(_x, y) { if (behavior === "auto") position = y; } };
+    const moved = await probeCaptureWindowScroll(pageWindow, 4003, async () => {});
+    return { moved, restored: position === 0, styleRestored: behavior === "smooth" && priority === "important" };
+  })()`, probeContext);
+  if (!smoothDocumentProbe.moved || !smoothDocumentProbe.restored || !smoothDocumentProbe.styleRestored) {
+    throw new Error("document scrolling with smooth !important behavior must be detected and restored without requiring a debugger wheel");
+  }
+  if (!captureSource.includes("const windowScrollVerified = await probeCaptureWindowScroll(window, windowRange)") ||
+      !captureSource.includes('event: "window-scroll-preflight"') ||
+      !captureSource.includes("if (windowScrollVerified)")) {
+    throw new Error("verified document scrolling must bypass debugger-only wheel preflight when the browser rejects debugger attachment");
+  }
   const clampContext = { chrome: { runtime: { onMessage: { addListener() {} } } } };
   const tail31 = vm.runInNewContext(`${captureSource}\nevaluateCaptureScrollClamp(4003, 3972, 3972, 24)`, clampContext);
   if (tail31.overrun || !tail31.reachedBottom || tail31.allowedRangeChange !== 64) {
@@ -450,7 +476,8 @@ for (const name of ["popup.html", "popup.js", "popup.css", "README.md", "VALIDAT
     throw new Error("sidebar regions and their ancestor shells must remain available and protected");
   }
   if (captureSource.includes("(panelY + sourceTopCss) * dpr")) throw new Error("sidebar source crop offset must not be added to its destination Y");
-  for (const marker of ["capture-full-page-segment", "begin-full-page-capture-session", "end-full-page-capture-session", "begin-full-page-download", "append-full-page-download", "finish-full-page-download", "window.scrollTo(0, targetY)", "const conservativeStride = Math.max(80, Math.min(180, Math.floor(captureStepHeight * 0.16)))", "const fastStride = Math.max(180, Math.floor(captureStepHeight * 0.7))", "MutationObserver", "garmin\\.com", "fastStaticStride", "uniqueSteps.length === 1 || fastStaticStride", "bottomClampPx", "outputCoveredCss", "第 ${i + 1} 段截圖高度無效", "長圖只拼接到", "for (let y = 0; y < scrollRange; y += captureStepStride)", "Never hide page elements while capturing", "網頁沒有捲動到第", "persistentSidePanelRoots", "persistentSidePanelRegions", "scrollCandidates", "panelSteps", "const panelY = panelSteps[index]", "panel.scroller.scrollTop = Math.min(panelY, panel.scrollRange)", "panel.contentHeight - panelY", "panel.originalScrollTop", 'ctx.clip("evenodd")', "panel.scroller.scrollTop = 0", "finally", "window.scrollTo(original.x"]) {
+  if (captureSource.indexOf("const isVisible =") < 0 || captureSource.indexOf("const isVisible =") > captureSource.indexOf("const fixedCandidates =")) throw new Error("isVisible must be initialized before the fixed-control scan");
+  for (const marker of ["capture-full-page-segment", "begin-full-page-capture-session", "end-full-page-capture-session", "begin-full-page-download", "append-full-page-download", "finish-full-page-download", "window.scrollTo(0, targetY)", "const conservativeStride = Math.max(80, Math.min(180, Math.floor(captureStepHeight * 0.16)))", "const fastStride = Math.max(180, Math.floor(captureStepHeight * 0.7))", "MutationObserver", "garmin\\.com", "fastStaticStride", "uniqueSteps.length === 1 || fastStaticStride", "bottomClampPx", "outputCoveredCss", "第 ${i + 1} 段截圖高度無效", "長圖只拼接到", "for (let y = 0; y < scrollRange; y += captureStepStride)", "isFixedCaptureChrome", "repeated-fixed-ui-filter", "repeatedFixedUiOriginals", "網頁沒有捲動到第", "persistentSidePanelRoots", "persistentSidePanelRegions", "scrollCandidates", "panelSteps", "const panelY = panelSteps[index]", "panel.scroller.scrollTop = Math.min(panelY, panel.scrollRange)", "panel.contentHeight - panelY", "panel.originalScrollTop", 'ctx.clip("evenodd")', "panel.scroller.scrollTop = 0", "finally", "window.scrollTo(original.x"]) {
     if (!captureSource.includes(marker)) throw new Error(`background-safe capture feature missing: ${marker}`);
   }
   if (!backgroundSource.includes('const captureFormat = "png"') || !backgroundSource.includes('createImagePage(options.oneNoteSectionId, pngBlob')) {
@@ -540,10 +567,24 @@ if (captureSource.includes('canvasToBlob(part.canvas, imageOptions.mimeType') ||
 if (captureSource.includes('captureSegmentWithRetry(jobId, windowId, captureOptions, `第 ${i + 1} 段`)')) {
   throw new Error("full-page tiles must not be compressed as JPG before stitching");
 }
-if (captureSource.includes("el.style.setProperty('visibility', 'hidden'") || captureSource.includes('pos === "sticky"')) {
-    throw new Error("full-page capture must not hide page content based on element positioning");
-  }
-  console.log("Smoke tests passed: v2.5.37 handles infinite-scroll height growth, preserves browser zoom, keeps intermediate stitching lossless, and retains full capture features");
+const fixedUiContext = { chrome: { runtime: { onMessage: { addListener() {} } } } };
+const fixedUiOutcomes = vm.runInNewContext(`${captureSource}\n(() => {
+  const style = { position: "fixed" };
+  const rect = { left: 4, top: 1080, right: 52, bottom: 1128, width: 48, height: 48 };
+  const fixedWidget = { getBoundingClientRect: () => rect };
+  const stillFixed = isRepeatedFixedCaptureUi(fixedWidget, rect, 1433, 1132, () => style);
+  const movedRect = { ...rect, top: 720, bottom: 768 };
+  const pageContent = { getBoundingClientRect: () => movedRect };
+  const movedContentRejected = !isRepeatedFixedCaptureUi(pageContent, rect, 1433, 1132, () => style);
+  const centerRect = { left: 500, top: 400, right: 548, bottom: 448, width: 48, height: 48 };
+  const centeredWidget = { getBoundingClientRect: () => centerRect };
+  const centralUiPreserved = !isFixedCaptureChrome(centeredWidget, centerRect, 1433, 1132, () => style);
+  return { stillFixed, movedContentRejected, centralUiPreserved };
+})()`, fixedUiContext);
+if (!fixedUiOutcomes.stillFixed || !fixedUiOutcomes.movedContentRejected || !fixedUiOutcomes.centralUiPreserved) {
+  throw new Error("only small fixed edge controls that remain stationary across scrolling may be hidden from later tiles");
+}
+console.log("Smoke tests passed: v2.5.40 fixes fixed-UI visibility helper initialization order and retains capture regressions");
 })().catch((error) => {
   console.error(error);
   process.exitCode = 1;

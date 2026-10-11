@@ -79,6 +79,29 @@ function getChatGPTCaptureLayout(contentRect) {
   return { sidebarWidth, contentWidth, outputWidth: sidebarWidth + contentWidth };
 }
 
+function isFixedCaptureChrome(element, rect, viewportWidth, viewportHeight, styleReader = globalThis.getComputedStyle) {
+  if (!element || !rect || typeof styleReader !== "function") return false;
+  const style = styleReader(element);
+  if (style.position !== "fixed" || rect.width <= 1 || rect.height <= 1 ||
+      rect.right <= 0 || rect.bottom <= 0 || rect.left >= viewportWidth || rect.top >= viewportHeight) return false;
+  const cornerPinned = (rect.left <= 32 || rect.right >= viewportWidth - 32) &&
+    (rect.top <= 32 || rect.bottom >= viewportHeight - 32);
+  const horizontalChromeBar = rect.height <= 40 && rect.width >= viewportWidth * 0.65 &&
+    (rect.top <= 32 || rect.bottom >= viewportHeight - 32);
+  const verticalChromeBar = rect.width <= 40 && rect.height >= viewportHeight * 0.6 &&
+    (rect.left <= 32 || rect.right >= viewportWidth - 32);
+  const compactWidget = rect.width <= 180 && rect.height <= 180 && cornerPinned;
+  return compactWidget || horizontalChromeBar || verticalChromeBar;
+}
+
+function isRepeatedFixedCaptureUi(element, initialRect, viewportWidth, viewportHeight,
+  styleReader = globalThis.getComputedStyle) {
+  if (!initialRect || !isFixedCaptureChrome(element, element.getBoundingClientRect(), viewportWidth, viewportHeight, styleReader)) return false;
+  const current = element.getBoundingClientRect();
+  return Math.abs(current.left - initialRect.left) <= 3 && Math.abs(current.top - initialRect.top) <= 3 &&
+    Math.abs(current.width - initialRect.width) <= 3 && Math.abs(current.height - initialRect.height) <= 3;
+}
+
 function canTrimCaptureTail(preflightHeight, liveHeight, coveredHeight, scrollY, liveMaxY, bottomClampPx = 0) {
   const atLiveBottom = scrollY >= liveMaxY - 3 ||
     (bottomClampPx > 0 && bottomClampPx <= 64 && scrollY >= liveMaxY - bottomClampPx - 3);
@@ -311,6 +334,9 @@ function findMovedCaptureScroller(documentObject, beforePositions, direction = 1
     let canvases = [];
     let persistentSidePanelRegions = [];
     let chatGPTHiddenUi = [];
+    let repeatedFixedUi = [];
+    let repeatedFixedUiOriginals = [];
+    let repeatedFixedUiFiltered = false;
     let debuggerSessionStarted = false;
     let bottomClampPx = 0;
     let scrollProbeDiagnostics = "尚未執行滾輪驗證";
@@ -523,6 +549,30 @@ function findMovedCaptureScroller(documentObject, beforePositions, direction = 1
         activeScroller.scrollTo(0, getCapturePhysicalScrollY(0, scrollRange, activeScrollerIsReversed));
       } else window.scrollTo(0, 0);
 
+      const isVisible = (el, rect = el.getBoundingClientRect()) => {
+        const style = getComputedStyle(el);
+        return style.display !== "none" && style.visibility !== "hidden" && Number(style.opacity || 1) !== 0 &&
+          rect.width > 1 && rect.height > 1 && rect.right > 0 && rect.bottom > 0 &&
+          rect.left < viewportWidth && rect.top < viewportHeight;
+      };
+
+      // Snapshot only compact controls pinned to viewport corners/edges. They
+      // belong in the first tile, but repeating them at every overlap makes a
+      // long page look corrupted. Their fixed position is re-verified after
+      // scrolling before any element is hidden; ordinary content and sticky
+      // rows are never filtered by this path.
+      if (!chatGPTContentCapture) {
+        const fixedCandidates = [...document.querySelectorAll("body *")].filter((element) => {
+          const rect = element.getBoundingClientRect();
+          const style = getComputedStyle(element);
+          return isVisible(element, rect) && isFixedCaptureChrome(element, rect, viewportWidth, viewportHeight,
+            () => style);
+        });
+        repeatedFixedUi = fixedCandidates.filter((element) =>
+          !fixedCandidates.some((other) => other !== element && other.contains(element)))
+          .map((element) => ({ element, rect: element.getBoundingClientRect() }));
+      }
+
       const dpr = window.devicePixelRatio || 1;
       const outputWidth = Math.round(width * dpr);
       const outputHeight = Math.round(height * dpr);
@@ -536,12 +586,6 @@ function findMovedCaptureScroller(documentObject, beforePositions, direction = 1
 
       const scrollDescription = activeScroller ? "內部捲動區" : "整個頁面";
 
-      const isVisible = (el, rect = el.getBoundingClientRect()) => {
-        const style = getComputedStyle(el);
-        return style.display !== "none" && style.visibility !== "hidden" && Number(style.opacity || 1) !== 0 &&
-          rect.width > 1 && rect.height > 1 && rect.right > 0 && rect.bottom > 0 &&
-          rect.left < viewportWidth && rect.top < viewportHeight;
-      };
       // Detect the complete edge sidebar, not just its outer fixed element.
       // Frameworks may mark inner controls/containers fixed or sticky too; if
       // those descendants are hidden independently, labels remain but inputs
@@ -956,14 +1000,27 @@ function findMovedCaptureScroller(documentObject, beforePositions, direction = 1
           ? captureViewportHeight + getMaxScrollY()
           : getCaptureDocumentHeight(root, body);
         expandCaptureHeight(liveHeightAfterScroll);
-        // Never hide page elements while capturing. Position-based filtering
-        // can classify virtualized table rows or charts as floating chrome,
-        // which permanently removes real content from the exported image.
-        // Repeated fixed UI is preferable to missing page data.
-
         // Static pages verified by the reversible probe need less paint time;
         // keep the longer delay on dynamic/unknown pages to avoid missing rows.
         await sleep(fastStaticStride ? 110 : 260);
+        if (i > 0 && repeatedFixedUi.length && !repeatedFixedUiFiltered) {
+          repeatedFixedUiFiltered = true;
+          const verifiedFixedUi = repeatedFixedUi.filter(({ element, rect }) =>
+            isRepeatedFixedCaptureUi(element, rect, viewportWidth, viewportHeight, getComputedStyle));
+          repeatedFixedUiOriginals = verifiedFixedUi.map(({ element }) => ({
+            element,
+            visibility: element.style.getPropertyValue("visibility"),
+            priority: element.style.getPropertyPriority("visibility")
+          }));
+          for (const item of repeatedFixedUiOriginals) item.element.style.setProperty("visibility", "hidden", "important");
+          sendProgress(jobId, null, "", "", { event: "repeated-fixed-ui-filter",
+            hiddenCount: repeatedFixedUiOriginals.length,
+            controls: repeatedFixedUiOriginals.map(({ element }) => {
+              const rect = element.getBoundingClientRect();
+              return { tag: element.tagName?.toLowerCase() || "element", id: element.id || "",
+                rect: { x: Math.round(rect.x), y: Math.round(rect.y), width: Math.round(rect.width), height: Math.round(rect.height) } };
+            }) });
+        }
         const captured = await captureSegmentWithRetry(jobId, windowId, segmentCaptureOptions, `第 ${i + 1} 段`);
         const image = await loadImage(captured.dataUrl);
         sendProgress(jobId, null, "", "", { event: "segment-captured", segment: i + 1, total: uniqueSteps.length,
@@ -1217,6 +1274,11 @@ function findMovedCaptureScroller(documentObject, beforePositions, direction = 1
         panel.scroller.style.scrollBehavior = panel.originalScrollBehavior;
       }
       for (const item of chatGPTHiddenUi) {
+        if (!item.element?.style) continue;
+        if (item.visibility) item.element.style.setProperty("visibility", item.visibility, item.priority || "");
+        else item.element.style.removeProperty("visibility");
+      }
+      for (const item of repeatedFixedUiOriginals) {
         if (!item.element?.style) continue;
         if (item.visibility) item.element.style.setProperty("visibility", item.visibility, item.priority || "");
         else item.element.style.removeProperty("visibility");

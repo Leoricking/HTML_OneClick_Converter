@@ -6,6 +6,10 @@
 - v2.5.16 checks alternative nested candidates and document.scrollingElement before capture
 Validation report
 =================
+- v2.5.40 regression verifies isVisible is initialized before the fixed-control scan that calls it
+- v2.5.40 fixes the temporal-dead-zone ReferenceError reported by the v2.5.39 capture log
+- v2.5.39 regression: fixed corner controls are filtered from later tiles only after their viewport position is verified unchanged by page scrolling; moving content and centered elements remain untouched
+- v2.5.39 restores the original visibility and priority of every filtered element in the capture cleanup path
 - v2.5.38 regression: document scroll probe handles smooth !important styles, detects actual document-root movement, restores position and CSS, and avoids requiring debugger-only wheel input after verified movement
 - v2.5.38 retains browser zoom and uses the verified document scroll path when background debugger attachment is unavailable
 - v2.5.36 regression test verifies 175% browser zoom remains unchanged during full-page capture
