@@ -55,6 +55,21 @@ function getFastStaticCaptureStride(viewportHeight) {
   return Math.max(180, Math.floor(viewportHeight * 0.7));
 }
 
+function getDynamicCaptureStride(viewportHeight) {
+  // Dynamic/unknown pages use a 70%-viewport stride, leaving about 30%
+  // overlap to balance capture speed with protection against missing content.
+  return Math.max(80, Math.floor(viewportHeight * 0.7));
+}
+
+function getFirstCaptureTileLimit(pageHeight, viewportHeight, stride, fastStaticStride, isOnlyTile) {
+  // A large stride can exceed the old shortened first tile and create a gap
+  // before tile 2. Keep the first tile full-height whenever stride > 50%.
+  if (isOnlyTile || fastStaticStride || stride > viewportHeight * 0.5) {
+    return Math.min(pageHeight, viewportHeight);
+  }
+  return Math.max(1, viewportHeight - stride);
+}
+
 function isReverseCaptureScroller(element, styleReader = globalThis.getComputedStyle) {
   if (!element) return false;
   const view = element.ownerDocument?.defaultView;
@@ -613,7 +628,7 @@ function findMovedCaptureScroller(documentObject, beforePositions, direction = 1
       // Unknown or data-heavy pages use the proven conservative stride. A
       // larger stride is selected only after a preflight confirms a static,
       // non-table page; see the mutation probe before the capture loop.
-      const conservativeStride = Math.max(80, Math.min(180, Math.floor(captureStepHeight * 0.16)));
+      const conservativeStride = getDynamicCaptureStride(captureStepHeight);
       let captureStepStride = conservativeStride;
       const chatGPTContentCapture = Boolean(activeScroller && /(^|\.)chatgpt\.com$/i.test(location.hostname));
       const iframeContentCapture = Boolean(activeScroller && activeScroller.ownerDocument !== document &&
@@ -1036,8 +1051,8 @@ function findMovedCaptureScroller(documentObject, beforePositions, direction = 1
       // Fast path: take a short, reversible scroll probe. Only pages with no
       // table/grid/canvas content, no known Garmin app surface, and no DOM
       // mutations during the probe use the former ~70%-viewport stride.
-      // All uncertain or data-heavy pages keep the conservative 180px stride
-      // to protect virtualized rows and images from being skipped.
+      // Uncertain or data-heavy pages keep a 40%-viewport stride (60% overlap)
+      // to cover virtualized rows and delayed images while reducing tile count.
       const hasDataHeavyContent = Boolean(
         /(^|\.)garmin\.com$/i.test(location.hostname) ||
         document.querySelector("table,[role='grid'],[role='table'],canvas")
@@ -1145,7 +1160,7 @@ function findMovedCaptureScroller(documentObject, beforePositions, direction = 1
           throw new Error(`拼接位置不連續（第 ${i + 1} 段：要求 ${Math.round(y)} px、實際 ${Math.round(actualY)} px、已覆蓋 ${Math.round(outputCoveredCss)} px、視窗 ${Math.round(captureViewportHeight)} px），已停止以免輸出缺列。`);
         }
         const firstTileLimit = i === 0
-          ? (uniqueSteps.length === 1 || fastStaticStride ? Math.min(height, captureViewportHeight) : Math.max(1, captureViewportHeight - captureStepStride))
+          ? getFirstCaptureTileLimit(height, captureViewportHeight, captureStepStride, fastStaticStride, uniqueSteps.length === 1)
           : captureViewportHeight - sourceTopCss;
         const drawCssHeight = Math.min(firstTileLimit, captureViewportHeight - sourceTopCss, height - outputCoveredCss);
         if (drawCssHeight <= 0) { image.close?.(); break; }

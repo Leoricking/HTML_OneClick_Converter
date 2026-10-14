@@ -1,3 +1,11 @@
+- v2.5.48 regression reproduces viewport=603 px / stride=422 px and verifies a full first tile gives tile 2 a 181 px overlap instead of a negative source offset
+- v2.5.48 first-tile limit tests cover large stride, small stride, fast-static, and single-tile cases
+- v2.5.47 dynamic-page stride is 70% of viewport height, retaining about 30% overlap while preserving wait and stitching checks
+- v2.5.47 regression verifies dynamic stride and expected segment-count estimate
+- v2.5.46 dynamic-page stride is 50% viewport height with 50% overlap; paint delay and stitching checks are unchanged
+- v2.5.46 regression verifies expected stride values and 150-to-120 estimated segment reduction
+- v2.5.45 dynamic-page stride is 40% viewport height, retaining 60% overlap while reducing tile count
+- v2.5.45 retains dynamic-page paint delay, scroll verification, full-resolution PNG segments, and contiguous stitching checks
 - v2.5.18 verifies window scrolling first and tests inner scroll containers when the window does not move; no height-ratio guess is used
 - v2.5.18 regression tests cover moving window, blocked window, moving inner container, and stuck wrapper
 - v2.5.17 sends a bounded CDP wheel event only when direct scrolling stalls, then rechecks actual document/container movement
