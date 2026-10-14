@@ -6,6 +6,10 @@
 - v2.5.16 checks alternative nested candidates and document.scrollingElement before capture
 Validation report
 =================
+- v2.5.44 regression verifies stable inner scrollers qualify for the existing 70%-viewport fast stride after a reversible mutation probe
+- v2.5.44 data-heavy pages (Garmin, tables, grids, canvas) remain on conservative stride
+- v2.5.44 mutation probe watches both the page body and the active same-origin iframe body before enabling the fast stride
+- v2.5.44 keeps the 30% screenshot overlap and contiguous uncovered-strip stitching
 - v2.5.43 excludes resize-sensor-shrink/expand elements from full-page scroll candidates
 - v2.5.43 temporarily disables pointer hit-testing on resize sensors and restores the exact original inline pointer-events style
 - v2.5.43 regression reproduces the supplied HackMD sensor at scrollTop 626 / range 625 and confirms it cannot become the capture scroller

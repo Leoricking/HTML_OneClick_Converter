@@ -47,6 +47,14 @@ function getCaptureDocumentHeight(root, body) {
   return Math.max(root.scrollHeight, body?.scrollHeight || 0, root.clientHeight);
 }
 
+function shouldProbeFastStaticCapture(hasDataHeavyContent, scrollRange, viewportHeight, hasMutationObserver) {
+  return !hasDataHeavyContent && hasMutationObserver && scrollRange > viewportHeight * 0.5;
+}
+
+function getFastStaticCaptureStride(viewportHeight) {
+  return Math.max(180, Math.floor(viewportHeight * 0.7));
+}
+
 function isReverseCaptureScroller(element, styleReader = globalThis.getComputedStyle) {
   if (!element) return false;
   const view = element.ownerDocument?.defaultView;
@@ -1031,18 +1039,21 @@ function findMovedCaptureScroller(documentObject, beforePositions, direction = 1
       // All uncertain or data-heavy pages keep the conservative 180px stride
       // to protect virtualized rows and images from being skipped.
       const hasDataHeavyContent = Boolean(
-        activeScroller || /(^|\.)garmin\.com$/i.test(location.hostname) ||
+        /(^|\.)garmin\.com$/i.test(location.hostname) ||
         document.querySelector("table,[role='grid'],[role='table'],canvas")
       );
       let fastStaticStride = false;
-      if (!hasDataHeavyContent && scrollRange > captureStepHeight * 1.5 && "MutationObserver" in window) {
-        const fastStride = Math.max(180, Math.floor(captureStepHeight * 0.7));
+      if (shouldProbeFastStaticCapture(hasDataHeavyContent, scrollRange, captureStepHeight, "MutationObserver" in window)) {
+        const fastStride = getFastStaticCaptureStride(captureStepHeight);
         let mutationSeen = false;
         const observer = new MutationObserver((records) => { if (records.length) mutationSeen = true; });
         // Ignore sticky-header style/class changes; they are not evidence that
         // article rows were virtualized. Text/node replacement still forces
         // the conservative stride.
-        observer.observe(body, { subtree: true, childList: true, characterData: true });
+        const mutationRoots = [...new Set([body, activeScroller?.ownerDocument?.body].filter(Boolean))];
+        for (const mutationRoot of mutationRoots) {
+          observer.observe(mutationRoot, { subtree: true, childList: true, characterData: true });
+        }
         try {
           await scrollToAndWait(Math.min(fastStride, scrollRange));
         } finally {

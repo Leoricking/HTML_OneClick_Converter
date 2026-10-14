@@ -6,7 +6,7 @@ const root = path.resolve(__dirname, "..");
 const read = (name) => fs.readFileSync(path.join(root, name), "utf8");
 
 const manifest = JSON.parse(read("manifest.json"));
-if (manifest.version !== "2.5.43") throw new Error("manifest version must be 2.5.43");
+if (manifest.version !== "2.5.44") throw new Error("manifest version must be 2.5.44");
 for (const permission of ["activeTab", "scripting", "downloads", "storage", "pageCapture", "clipboardWrite", "identity", "debugger"]) {
   if (!manifest.permissions.includes(permission)) throw new Error(`missing permission: ${permission}`);
 }
@@ -477,7 +477,7 @@ for (const name of ["popup.html", "popup.js", "popup.css", "README.md", "VALIDAT
   }
   if (captureSource.includes("(panelY + sourceTopCss) * dpr")) throw new Error("sidebar source crop offset must not be added to its destination Y");
   if (captureSource.indexOf("const isVisible =") < 0 || captureSource.indexOf("const isVisible =") > captureSource.indexOf("const fixedCandidates =")) throw new Error("isVisible must be initialized before the fixed-control scan");
-  for (const marker of ["capture-full-page-segment", "begin-full-page-capture-session", "end-full-page-capture-session", "begin-full-page-download", "append-full-page-download", "finish-full-page-download", "window.scrollTo(0, targetY)", "const conservativeStride = Math.max(80, Math.min(180, Math.floor(captureStepHeight * 0.16)))", "const fastStride = Math.max(180, Math.floor(captureStepHeight * 0.7))", "MutationObserver", "garmin\\.com", "fastStaticStride", "uniqueSteps.length === 1 || fastStaticStride", "bottomClampPx", "outputCoveredCss", "第 ${i + 1} 段截圖高度無效", "長圖只拼接到", "for (let y = 0; y < scrollRange; y += captureStepStride)", "isFixedCaptureChrome", "repeated-fixed-ui-filter", "repeatedFixedUiOriginals", "網頁沒有捲動到第", "persistentSidePanelRoots", "persistentSidePanelRegions", "scrollCandidates", "panelSteps", "const panelY = panelSteps[index]", "panel.scroller.scrollTop = Math.min(panelY, panel.scrollRange)", "panel.contentHeight - panelY", "panel.originalScrollTop", 'ctx.clip("evenodd")', "panel.scroller.scrollTop = 0", "finally", "window.scrollTo(original.x"]) {
+  for (const marker of ["capture-full-page-segment", "begin-full-page-capture-session", "end-full-page-capture-session", "begin-full-page-download", "append-full-page-download", "finish-full-page-download", "window.scrollTo(0, targetY)", "const conservativeStride = Math.max(80, Math.min(180, Math.floor(captureStepHeight * 0.16)))", "function getFastStaticCaptureStride(viewportHeight)", "MutationObserver", "garmin\\.com", "fastStaticStride", "uniqueSteps.length === 1 || fastStaticStride", "bottomClampPx", "outputCoveredCss", "第 ${i + 1} 段截圖高度無效", "長圖只拼接到", "for (let y = 0; y < scrollRange; y += captureStepStride)", "isFixedCaptureChrome", "repeated-fixed-ui-filter", "repeatedFixedUiOriginals", "網頁沒有捲動到第", "persistentSidePanelRoots", "persistentSidePanelRegions", "scrollCandidates", "panelSteps", "const panelY = panelSteps[index]", "panel.scroller.scrollTop = Math.min(panelY, panel.scrollRange)", "panel.contentHeight - panelY", "panel.originalScrollTop", 'ctx.clip("evenodd")', "panel.scroller.scrollTop = 0", "finally", "window.scrollTo(original.x"]) {
     if (!captureSource.includes(marker)) throw new Error(`background-safe capture feature missing: ${marker}`);
   }
   if (!backgroundSource.includes('const captureFormat = "png"') || !backgroundSource.includes('createImagePage(options.oneNoteSectionId, pngBlob')) {
@@ -631,7 +631,21 @@ const iframeOutcomes = vm.runInNewContext(`${captureSource}\n(() => {
 if (!iframeOutcomes.scanned || !iframeOutcomes.found || iframeOutcomes.rect.left !== 100 || iframeOutcomes.rect.top !== 50) {
   throw new Error("accessible iframe scrollers must be discovered and mapped to the top-level screenshot viewport");
 }
-console.log("Smoke tests passed: v2.5.43 excludes HackMD resize sensors, passes through wheel input, restores styles, detects iframe scroll areas, and retains capture regressions");
+const speedContext = { chrome: { runtime: { onMessage: { addListener() {} } } } };
+const speedOutcomes = vm.runInNewContext(`${captureSource}\n({
+  stableInner: shouldProbeFastStaticCapture(false, 625, 631, true),
+  shortPage: shouldProbeFastStaticCapture(false, 300, 631, true),
+  noObserver: shouldProbeFastStaticCapture(false, 2000, 631, false),
+  table: shouldProbeFastStaticCapture(true, 5000, 800, true),
+  stride: getFastStaticCaptureStride(631)
+})`, speedContext);
+if (!speedOutcomes.stableInner || speedOutcomes.shortPage || speedOutcomes.noObserver || speedOutcomes.table || speedOutcomes.stride !== 441) {
+  throw new Error("fast capture must include stable inner scrollers, preserve conservative exclusions, and retain the proven 70% stride");
+}
+if (!captureSource.includes("const mutationRoots = [...new Set([body, activeScroller?.ownerDocument?.body].filter(Boolean))]")) {
+  throw new Error("fast stride must observe both the page and active iframe body for content mutations");
+}
+console.log("Smoke tests passed: v2.5.44 stable-page speed path, v2.5.43 HackMD sensor fix, iframe scroll detection, and capture regressions");
 })().catch((error) => {
   console.error(error);
   process.exitCode = 1;
