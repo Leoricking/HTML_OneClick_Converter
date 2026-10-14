@@ -1,10 +1,17 @@
-# HTML 一鍵轉換器／網頁剪藏 v2.5.40
+# HTML 一鍵轉換器／網頁剪藏 v2.5.43
 
 適用於 Chromium 架構瀏覽器：
 
 - Google Chrome
 - Microsoft Edge
 - Opera
+
+## v2.5.43：修正 HackMD resize sensor 阻擋完整頁面截圖
+
+- `resize-sensor-shrink`／`resize-sensor-expand` 是版面尺寸感測器，不再將它們誤認為實際捲動容器。
+- 擷取期間暫時讓感測器的指標事件穿透，讓滾輪預檢能命中真正的頁面或 iframe 捲動區；結束時會還原原本樣式。
+- 掃描可存取的同源 iframe 捲動區，並依 iframe 中實際捲動容器裁切、拼接；保留目前瀏覽器縮放比例、圖片格式及原有下載流程。
+- 新增以 HackMD log 中的 `div.resize-sensor-shrink`、range 625、200% 縮放情境為基礎的回歸測試。
 
 ## v2.5.40：修正完整頁面截圖初始化錯誤
 

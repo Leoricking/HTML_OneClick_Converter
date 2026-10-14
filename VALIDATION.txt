@@ -6,6 +6,10 @@
 - v2.5.16 checks alternative nested candidates and document.scrollingElement before capture
 Validation report
 =================
+- v2.5.43 excludes resize-sensor-shrink/expand elements from full-page scroll candidates
+- v2.5.43 temporarily disables pointer hit-testing on resize sensors and restores the exact original inline pointer-events style
+- v2.5.43 regression reproduces the supplied HackMD sensor at scrollTop 626 / range 625 and confirms it cannot become the capture scroller
+- v2.5.43 scans accessible same-origin iframe documents and crops stitched output to an iframe's measured scroller viewport
 - v2.5.40 regression verifies isVisible is initialized before the fixed-control scan that calls it
 - v2.5.40 fixes the temporal-dead-zone ReferenceError reported by the v2.5.39 capture log
 - v2.5.39 regression: fixed corner controls are filtered from later tiles only after their viewport position is verified unchanged by page scrolling; moving content and centered elements remain untouched

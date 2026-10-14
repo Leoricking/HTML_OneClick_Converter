@@ -49,7 +49,9 @@ function getCaptureDocumentHeight(root, body) {
 
 function isReverseCaptureScroller(element, styleReader = globalThis.getComputedStyle) {
   if (!element) return false;
-  return element.scrollTop < -3 || (typeof styleReader === "function" && styleReader(element).flexDirection === "column-reverse");
+  const view = element.ownerDocument?.defaultView;
+  const reader = view?.getComputedStyle ? view.getComputedStyle.bind(view) : styleReader;
+  return element.scrollTop < -3 || (typeof reader === "function" && reader(element).flexDirection === "column-reverse");
 }
 
 function getCaptureLogicalScrollY(element, isReversed, maxY) {
@@ -182,13 +184,78 @@ async function selectCaptureScrollContainer(windowObject, windowRange, candidate
   return null;
 }
 
+function isCaptureResizeSensor(element) {
+  if (!element) return false;
+  const className = typeof element.className === "string" ? element.className : element.className?.baseVal || "";
+  const identity = `${element.id || ""} ${className} ${element.getAttribute?.("data-testid") || ""}`;
+  return /resize[-_ ]?sensor(?:[-_ ](?:shrink|expand))?/i.test(identity);
+}
+
+function getAccessibleCaptureDocuments(documentObject) {
+  const documents = [];
+  const seen = new Set();
+  const pending = [documentObject];
+  while (pending.length) {
+    const current = pending.shift();
+    if (!current || seen.has(current)) continue;
+    seen.add(current);
+    documents.push(current);
+    for (const frame of current.querySelectorAll?.("iframe") || []) {
+      try {
+        const childDocument = frame.contentDocument;
+        if (childDocument?.documentElement && !seen.has(childDocument)) pending.push(childDocument);
+      } catch { /* Cross-origin iframe contents are intentionally inaccessible. */ }
+    }
+  }
+  return documents;
+}
+
+function getCaptureElementStyle(element) {
+  const view = element?.ownerDocument?.defaultView || globalThis;
+  return typeof view.getComputedStyle === "function" ? view.getComputedStyle(element) : globalThis.getComputedStyle(element);
+}
+
+function getCaptureElementRectInTopViewport(element, topWindow = globalThis) {
+  let rect = element.getBoundingClientRect();
+  let view = element.ownerDocument?.defaultView;
+  while (view && view !== topWindow && view.frameElement) {
+    const frameRect = view.frameElement.getBoundingClientRect();
+    rect = { left: rect.left + frameRect.left, top: rect.top + frameRect.top,
+      right: rect.right + frameRect.left, bottom: rect.bottom + frameRect.top,
+      width: rect.width, height: rect.height };
+    view = view.parent;
+  }
+  return rect;
+}
+
+function disableCaptureResizeSensorHitTesting(documentObject) {
+  const originals = [];
+  for (const currentDocument of getAccessibleCaptureDocuments(documentObject)) {
+    for (const sensor of currentDocument.querySelectorAll(".resize-sensor-shrink,.resize-sensor-expand,[class*='resize-sensor']")) {
+      const style = sensor.style;
+      originals.push({ element: sensor, value: style.getPropertyValue("pointer-events"),
+        priority: style.getPropertyPriority("pointer-events") });
+      style.setProperty("pointer-events", "none", "important");
+    }
+  }
+  return originals;
+}
+
+function restoreCaptureResizeSensorHitTesting(originals) {
+  for (const item of originals || []) {
+    if (!item.element?.style) continue;
+    if (item.value) item.element.style.setProperty("pointer-events", item.value, item.priority || "");
+    else item.element.style.removeProperty("pointer-events");
+  }
+}
+
 async function probeCaptureWheelScrollContainer(windowObject, candidates, documentScroller, dispatchWheel,
   waitFrame = () => new Promise((resolve) => requestAnimationFrame(resolve)), documentObject = null) {
   const elements = [...new Set([
     ...candidates.map((candidate) => candidate.element || candidate),
     documentScroller,
     ...(documentObject ? collectLiveCaptureScrollers(documentObject) : [])
-  ].filter(Boolean))];
+  ].filter((element) => element && !isCaptureResizeSensor(element)))];
   const beforeWindowY = windowObject.scrollY;
   const before = new Map(elements.map((element) => [element, element.scrollTop]));
   const scrollable = elements.filter((element) => element.scrollHeight - element.clientHeight > 32);
@@ -245,15 +312,36 @@ function collectLiveCaptureScrollers(documentObject) {
   const result = [];
   const seen = new Set();
   const add = (element) => {
-    if (!element || seen.has(element)) return;
+    if (!element || seen.has(element) || isCaptureResizeSensor(element)) return;
     seen.add(element);
     if (element.scrollHeight - element.clientHeight > 32) result.push(element);
   };
-  add(documentObject.scrollingElement);
-  add(documentObject.documentElement);
-  add(documentObject.body);
-  for (const element of documentObject.querySelectorAll("body *")) add(element);
+  for (const current of getAccessibleCaptureDocuments(documentObject)) {
+    add(current.scrollingElement);
+    add(current.documentElement);
+    add(current.body);
+    for (const element of current.querySelectorAll("body *")) add(element);
+  }
   return result;
+}
+
+function collectCaptureScrollCandidates(documentObject, viewportWidth, viewportHeight) {
+  const candidates = [];
+  for (const currentDocument of getAccessibleCaptureDocuments(documentObject)) {
+    for (const element of currentDocument.querySelectorAll("body *")) {
+      if (isCaptureResizeSensor(element)) continue;
+      const style = getCaptureElementStyle(element);
+      const range = element.scrollHeight - element.clientHeight;
+      if (range < 32 || element.clientHeight < viewportHeight * 0.3 || element.clientWidth < viewportWidth * 0.3) continue;
+      const rect = getCaptureElementRectInTopViewport(element, documentObject.defaultView);
+      const visibleWidth = Math.max(0, Math.min(rect.right, viewportWidth) - Math.max(rect.left, 0));
+      const visibleHeight = Math.max(0, Math.min(rect.bottom, viewportHeight) - Math.max(rect.top, 0));
+      if (visibleWidth < viewportWidth * 0.25 || visibleHeight < viewportHeight * 0.25) continue;
+      const visibleAreaRatio = visibleWidth * visibleHeight / (viewportWidth * viewportHeight);
+      candidates.push({ element, range, score: range * (0.5 + visibleAreaRatio) });
+    }
+  }
+  return candidates.sort((a, b) => b.score - a.score);
 }
 
 function findMovedCaptureScroller(documentObject, beforePositions, direction = 1) {
@@ -341,6 +429,7 @@ function findMovedCaptureScroller(documentObject, beforePositions, direction = 1
     let bottomClampPx = 0;
     let scrollProbeDiagnostics = "尚未執行滾輪驗證";
     let captureScrollInputPoint = null;
+    const resizeSensorHitTestOriginals = [];
     try {
       const debuggerStart = await chrome.runtime.sendMessage({ type: "begin-full-page-capture-session", jobId });
       if (!debuggerStart?.ok) throw new Error(debuggerStart?.message || "無法啟用來源分頁背景截圖。");
@@ -353,6 +442,12 @@ function findMovedCaptureScroller(documentObject, beforePositions, direction = 1
       sendProgress(jobId, null, "", "", { event: "capture-zoom", originalZoom: debuggerStart.originalZoom,
         normalizedTo100: false, effectiveZoom: debuggerStart.originalZoom });
       root.style.scrollBehavior = "auto";
+      // HackMD's resize-sensor-shrink can cover the viewport with an invisible
+      // iframe. Its scrollHeight/scrollTop are only a resize measurement, and
+      // it can also intercept the trusted wheel used to find the real owner.
+      // Ignore it as a candidate and temporarily let pointer events pass
+      // through; restore the exact inline style in finally.
+      resizeSensorHitTestOriginals.push(...disableCaptureResizeSensorHitTesting(document));
       const viewportWidth = window.innerWidth;
       const viewportHeight = window.innerHeight;
       const pageWidth = Math.max(root.scrollWidth, body.scrollWidth || 0, root.clientWidth);
@@ -362,23 +457,11 @@ function findMovedCaptureScroller(documentObject, beforePositions, direction = 1
       // Detect likely nested scrollers, then probe their actual scrollTop
       // behavior. ChatGPT and other SPAs can expose a large scrollHeight on a
       // wrapper that is not the element that owns user scrolling.
-      const scrollCandidates = [];
-      for (const el of document.querySelectorAll("body *")) {
-        const style = getComputedStyle(el);
-        // Do not rely on overflowY alone. ChatGPT and other SPAs can route
-        // wheel events through a clipped/transformed shell whose computed
-        // overflow value does not advertise it as the scroll owner.
-        const range = el.scrollHeight - el.clientHeight;
-        if (range < 32 || el.clientHeight < viewportHeight * 0.3 || el.clientWidth < viewportWidth * 0.3) continue;
-        const rect = el.getBoundingClientRect();
-        const visibleWidth = Math.max(0, Math.min(rect.right, viewportWidth) - Math.max(rect.left, 0));
-        const visibleHeight = Math.max(0, Math.min(rect.bottom, viewportHeight) - Math.max(rect.top, 0));
-        if (visibleWidth < viewportWidth * 0.25 || visibleHeight < viewportHeight * 0.25) continue;
-        const visibleAreaRatio = visibleWidth * visibleHeight / (viewportWidth * viewportHeight);
-        const score = range * (0.5 + visibleAreaRatio);
-        scrollCandidates.push({ element: el, range, score });
-      }
-      scrollCandidates.sort((a, b) => b.score - a.score);
+      // Do not rely on overflowY alone. SPA pages can route wheel events
+      // through clipped/transformed shells whose CSS does not advertise their
+      // scroll ownership. Scan accessible frames too; resize sensors are
+      // filtered centrally before ranking.
+      const scrollCandidates = collectCaptureScrollCandidates(document, viewportWidth, viewportHeight);
       // Keep a second, less restrictive inventory for the trusted-wheel
       // probe. ChatGPT can place its conversation scroller inside a transformed
       // shell whose visible size/overflow styles fail the initial candidate
@@ -387,6 +470,7 @@ function findMovedCaptureScroller(documentObject, beforePositions, direction = 1
       const allLiveScrollers = collectLiveCaptureScrollers(document);
       const describeScroller = (el) => {
         const rect = el.getBoundingClientRect();
+        const style = getCaptureElementStyle(el);
         const className = typeof el.className === "string" ? el.className.trim().replace(/\s+/g, ".").slice(0, 180) : "";
         return {
           node: `${el.tagName?.toLowerCase() || "element"}${el.id ? `#${el.id}` : ""}${className ? `.${className}` : ""}`,
@@ -396,8 +480,8 @@ function findMovedCaptureScroller(documentObject, beforePositions, direction = 1
           scrollHeight: el.scrollHeight,
           clientHeight: el.clientHeight,
           range: Math.max(0, el.scrollHeight - el.clientHeight),
-          overflowY: getComputedStyle(el).overflowY,
-          flexDirection: getComputedStyle(el).flexDirection,
+          overflowY: style.overflowY,
+          flexDirection: style.flexDirection,
           scrollModel: isReverseCaptureScroller(el) ? "reverse-negative-scrollTop" : "normal-positive-scrollTop",
           rect: { x: Math.round(rect.x), y: Math.round(rect.y), width: Math.round(rect.width), height: Math.round(rect.height) }
         };
@@ -431,7 +515,7 @@ function findMovedCaptureScroller(documentObject, beforePositions, direction = 1
         const probeY = Math.min(viewportHeight - 1, Math.max(0, Math.round(viewportHeight * 0.45)));
         const pointCandidates = [];
         for (let node = document.elementFromPoint(probeX, probeY); node && node !== body; node = node.parentElement) {
-          if (node.scrollHeight - node.clientHeight > 32) pointCandidates.push(node);
+          if (!isCaptureResizeSensor(node) && node.scrollHeight - node.clientHeight > 32) pointCandidates.push(node);
         }
         const wheelCandidates = [...pointCandidates, ...scrollCandidates.map((candidate) => candidate.element), ...allLiveScrollers];
         const wheelProbe = await probeCaptureWheelScrollContainer(window, wheelCandidates, document.scrollingElement,
@@ -459,6 +543,11 @@ function findMovedCaptureScroller(documentObject, beforePositions, direction = 1
           windowRange = Math.max(0, pageHeight - viewportHeight);
         } else if (windowRange > 32 && wheelProbe.attempted && !wheelProbe.moved) {
           throw new Error(`找不到可驗證的頁面捲動來源；${scrollProbeDiagnostics}；候選數=${wheelCandidates.length}。為避免下載不完整圖片，已停止。`);
+        } else if (resizeSensorHitTestOriginals.length && hit?.tagName === "IFRAME" && !wheelProbe.moved) {
+          sendProgress(jobId, null, "", "", { event: "resize-sensor-iframe-hit-unresolved",
+            diagnostic: scrollProbeDiagnostics, sensorCount: resizeSensorHitTestOriginals.length,
+            message: "resize sensor 已穿透，但 iframe 內容沒有可驗證的捲動位置；不輸出只有目前畫面的圖片。" });
+          throw new Error(`頁面內容位於 iframe，且未偵測到可驗證的捲動位置；${scrollProbeDiagnostics}。為避免把目前畫面誤當整頁，已停止。請確認 iframe 內容已載入後再試。`);
         }
         sendProgress(jobId, null, "", "", { event: "wheel-preflight", diagnostic: scrollProbeDiagnostics,
           selectedScroller: activeScroller ? describeScroller(activeScroller) : null,
@@ -475,7 +564,7 @@ function findMovedCaptureScroller(documentObject, beforePositions, direction = 1
         const probeY = Math.min(viewportHeight - 1, Math.max(0, Math.round(viewportHeight * 0.45)));
         const pointCandidates = [];
         for (let node = document.elementFromPoint(probeX, probeY); node && node !== body; node = node.parentElement) {
-          if (node.scrollHeight - node.clientHeight > 32) pointCandidates.push(node);
+          if (!isCaptureResizeSensor(node) && node.scrollHeight - node.clientHeight > 32) pointCandidates.push(node);
         }
         const wheelProbe = await probeCaptureWheelScrollContainer(window, [
           ...pointCandidates,
@@ -519,14 +608,17 @@ function findMovedCaptureScroller(documentObject, beforePositions, direction = 1
       const conservativeStride = Math.max(80, Math.min(180, Math.floor(captureStepHeight * 0.16)));
       let captureStepStride = conservativeStride;
       const chatGPTContentCapture = Boolean(activeScroller && /(^|\.)chatgpt\.com$/i.test(location.hostname));
-      const scrollerRect = chatGPTContentCapture ? activeScroller.getBoundingClientRect() : null;
-      const captureRect = chatGPTContentCapture ? {
+      const iframeContentCapture = Boolean(activeScroller && activeScroller.ownerDocument !== document &&
+        activeScroller.ownerDocument?.defaultView?.frameElement);
+      const scrollerRect = (chatGPTContentCapture || iframeContentCapture)
+        ? getCaptureElementRectInTopViewport(activeScroller, window) : null;
+      const captureRect = (chatGPTContentCapture || iframeContentCapture) ? {
         left: Math.max(0, scrollerRect.left),
         top: Math.max(0, scrollerRect.top),
         width: Math.max(1, Math.min(viewportWidth, scrollerRect.right) - Math.max(0, scrollerRect.left)),
         height: Math.max(1, Math.min(viewportHeight, scrollerRect.bottom) - Math.max(0, scrollerRect.top))
       } : { left: 0, top: 0, width: viewportWidth, height: viewportHeight };
-      const captureViewportHeight = chatGPTContentCapture
+      const captureViewportHeight = (chatGPTContentCapture || iframeContentCapture)
         ? Math.min(activeScroller.clientHeight, captureRect.height)
         : viewportHeight;
       // Preserve the visible left rail once at the top of the finished image.
@@ -535,7 +627,7 @@ function findMovedCaptureScroller(documentObject, beforePositions, direction = 1
       // content-only crop lose the user's left-column context.
       const chatGPTLayout = chatGPTContentCapture
         ? getChatGPTCaptureLayout(captureRect)
-        : { sidebarWidth: 0, contentWidth: viewportWidth, outputWidth: activeScroller ? viewportWidth : pageWidth };
+        : { sidebarWidth: 0, contentWidth: captureRect.width, outputWidth: iframeContentCapture ? captureRect.width : activeScroller ? viewportWidth : pageWidth };
       const chatGPTSidebarWidth = chatGPTLayout.sidebarWidth;
       const width = chatGPTLayout.outputWidth;
       let height = activeScroller ? captureViewportHeight + scrollRange : pageHeight;
@@ -561,7 +653,7 @@ function findMovedCaptureScroller(documentObject, beforePositions, direction = 1
       // long page look corrupted. Their fixed position is re-verified after
       // scrolling before any element is hidden; ordinary content and sticky
       // rows are never filtered by this path.
-      if (!chatGPTContentCapture) {
+      if (!chatGPTContentCapture && !iframeContentCapture) {
         const fixedCandidates = [...document.querySelectorAll("body *")].filter((element) => {
           const rect = element.getBoundingClientRect();
           const style = getComputedStyle(element);
@@ -601,7 +693,7 @@ function findMovedCaptureScroller(documentObject, beforePositions, direction = 1
         const tall = rect.height >= viewportHeight * 0.35;
         return edge && narrow && tall && (isSidebarIdentity(el) || style.position === "fixed" || style.position === "sticky");
       };
-      const sidebarCandidates = chatGPTContentCapture ? [] : [...document.querySelectorAll("body *")]
+      const sidebarCandidates = (chatGPTContentCapture || iframeContentCapture) ? [] : [...document.querySelectorAll("body *")]
         .filter((el) => isVisible(el) && isPersistentSidePanel(el));
       const persistentSidePanelRoots = sidebarCandidates.filter((el) => {
         for (let parent = el.parentElement; parent && parent !== body; parent = parent.parentElement) {
@@ -1283,6 +1375,7 @@ function findMovedCaptureScroller(documentObject, beforePositions, direction = 1
         if (item.visibility) item.element.style.setProperty("visibility", item.visibility, item.priority || "");
         else item.element.style.removeProperty("visibility");
       }
+      restoreCaptureResizeSensorHitTesting(resizeSensorHitTestOriginals);
       root.style.scrollBehavior = original.behavior || "";
       root.style.overflow = original.overflow || "";
       if (debuggerSessionStarted) {

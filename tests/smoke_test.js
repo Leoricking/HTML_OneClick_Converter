@@ -6,7 +6,7 @@ const root = path.resolve(__dirname, "..");
 const read = (name) => fs.readFileSync(path.join(root, name), "utf8");
 
 const manifest = JSON.parse(read("manifest.json"));
-if (manifest.version !== "2.5.40") throw new Error("manifest version must be 2.5.40");
+if (manifest.version !== "2.5.43") throw new Error("manifest version must be 2.5.43");
 for (const permission of ["activeTab", "scripting", "downloads", "storage", "pageCapture", "clipboardWrite", "identity", "debugger"]) {
   if (!manifest.permissions.includes(permission)) throw new Error(`missing permission: ${permission}`);
 }
@@ -350,7 +350,7 @@ for (const name of ["popup.html", "popup.js", "popup.css", "README.md", "VALIDAT
   if (staleScrollOutcome.moved || staleScrollOutcome.scroller || !staleScrollOutcome.preserved) {
     throw new Error("wheel preflight must ignore an unmeasured scroller's existing scrollTop instead of falsely selecting and resetting it");
   }
-  if (!captureSource.includes("const range = el.scrollHeight - el.clientHeight") ||
+  if (!captureSource.includes("const range = element.scrollHeight - element.clientHeight") ||
       captureSource.includes("if (!/(auto|scroll|overlay|hidden)/.test(style.overflowY)) continue;")) {
     throw new Error("scroll candidates must not be discarded solely because the SPA shell uses nonstandard overflow styling");
   }
@@ -584,7 +584,54 @@ const fixedUiOutcomes = vm.runInNewContext(`${captureSource}\n(() => {
 if (!fixedUiOutcomes.stillFixed || !fixedUiOutcomes.movedContentRejected || !fixedUiOutcomes.centralUiPreserved) {
   throw new Error("only small fixed edge controls that remain stationary across scrolling may be hidden from later tiles");
 }
-console.log("Smoke tests passed: v2.5.40 fixes fixed-UI visibility helper initialization order and retains capture regressions");
+const sensorOutcomes = vm.runInNewContext(`${captureSource}\n(() => {
+  const declarations = new Map();
+  const style = { setProperty(name, value, priority) { declarations.set(name, { value, priority }); },
+    getPropertyValue(name) { return declarations.get(name)?.value || ""; },
+    getPropertyPriority(name) { return declarations.get(name)?.priority || ""; },
+    removeProperty(name) { declarations.delete(name); } };
+  const sensor = { tagName: "DIV", className: "resize-sensor-shrink", id: "", style,
+    scrollHeight: 1262, clientHeight: 631, clientWidth: 1254, scrollTop: 626, scrollLeft: 1254,
+    getAttribute: () => "", getBoundingClientRect: () => ({ left: 0, top: 0, right: 1254, bottom: 631, width: 1254, height: 631 }), isConnected: true };
+  const realScroller = { tagName: "DIV", className: "markdown-body", id: "content", style: {},
+    scrollHeight: 4800, clientHeight: 631, clientWidth: 1254, scrollTop: 0, scrollLeft: 0,
+    getAttribute: () => "", getBoundingClientRect: () => ({ left: 0, top: 0, right: 1254, bottom: 631, width: 1254, height: 631 }), isConnected: true };
+  const view = { getComputedStyle: (element) => ({ overflowY: "hidden", flexDirection: "row", position: "static" }) };
+  const pageDocument = { defaultView: view, scrollingElement: null, documentElement: null, body: null,
+    querySelectorAll: (selector) => selector === "iframe" ? [] : selector.includes("resize-sensor") ? [sensor] : [sensor, realScroller] };
+  const candidates = collectCaptureScrollCandidates(pageDocument, 1254, 631);
+  const liveScrollers = collectLiveCaptureScrollers(pageDocument);
+  const original = disableCaptureResizeSensorHitTesting(pageDocument);
+  const passedThrough = declarations.get("pointer-events")?.value === "none" && declarations.get("pointer-events")?.priority === "important";
+  restoreCaptureResizeSensorHitTesting(original);
+  const restored = !declarations.has("pointer-events");
+  return { sensorClassified: isCaptureResizeSensor(sensor), sensorExcluded: !candidates.some((x) => x.element === sensor) && !liveScrollers.includes(sensor),
+    realScrollerFound: candidates.some((x) => x.element === realScroller) && liveScrollers.includes(realScroller), passedThrough, restored };
+})()`, { getComputedStyle: () => ({ overflowY: "auto", flexDirection: "row" }), chrome: { runtime: { onMessage: { addListener() {} } } } });
+if (!sensorOutcomes.sensorClassified || !sensorOutcomes.sensorExcluded || !sensorOutcomes.realScrollerFound ||
+    !sensorOutcomes.passedThrough || !sensorOutcomes.restored) {
+  throw new Error("HackMD resize-sensor regression must exclude its range-625 sensor, detect the real scroller, and restore pointer events");
+}
+const iframeOutcomes = vm.runInNewContext(`${captureSource}\n(() => {
+  const childView = { getComputedStyle: () => ({ overflowY: "auto", flexDirection: "row" }), frameElement: null };
+  const childScroller = { tagName: "DIV", className: "iframe-content", id: "main", ownerDocument: null,
+    scrollHeight: 2400, clientHeight: 600, clientWidth: 800, getBoundingClientRect: () => ({ left: 0, top: 0, right: 800, bottom: 600, width: 800, height: 600 }) };
+  const childDocument = { defaultView: childView, documentElement: {}, querySelectorAll: () => [childScroller] };
+  childScroller.ownerDocument = childDocument;
+  const frame = { contentDocument: childDocument, getBoundingClientRect: () => ({ left: 100, top: 50, right: 900, bottom: 650, width: 800, height: 600 }) };
+  childView.frameElement = frame;
+  const parentView = {};
+  childView.parent = parentView;
+  const parentDocument = { defaultView: parentView, querySelectorAll: (selector) => selector === "iframe" ? [frame] : [] };
+  const docs = getAccessibleCaptureDocuments(parentDocument);
+  const candidates = collectCaptureScrollCandidates(parentDocument, 1000, 700);
+  const rect = getCaptureElementRectInTopViewport(childScroller, parentView);
+  return { scanned: docs.includes(childDocument), found: candidates.some((item) => item.element === childScroller), rect };
+})()`, { getComputedStyle: () => ({ overflowY: "auto", flexDirection: "row" }), chrome: { runtime: { onMessage: { addListener() {} } } } });
+if (!iframeOutcomes.scanned || !iframeOutcomes.found || iframeOutcomes.rect.left !== 100 || iframeOutcomes.rect.top !== 50) {
+  throw new Error("accessible iframe scrollers must be discovered and mapped to the top-level screenshot viewport");
+}
+console.log("Smoke tests passed: v2.5.43 excludes HackMD resize sensors, passes through wheel input, restores styles, detects iframe scroll areas, and retains capture regressions");
 })().catch((error) => {
   console.error(error);
   process.exitCode = 1;
